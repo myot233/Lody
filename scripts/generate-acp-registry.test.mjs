@@ -1,6 +1,25 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { buildRegistryIconArtifacts, validateRegistryIconSvg } from './generate-acp-registry.mjs';
+import {
+  buildRegistryIconArtifacts,
+  normalizeLocalAgent,
+  validateRegistryIconSvg,
+} from './generate-acp-registry.mjs';
+
+void describe('local ACP registry generation', () => {
+  void it('keeps OMP selectable when absent from the upstream registry', () => {
+    assert.deepEqual(normalizeLocalAgent(undefined, 'omp'), {
+      id: 'omp',
+      name: 'Oh My Pi (OMP)',
+      version: 'local',
+      description: 'Oh My Pi coding agent with native ACP support',
+      icon: undefined,
+      distribution: {
+        local: { command: 'omp', args: ['acp'], versionArgs: ['--version'] },
+      },
+    });
+  });
+});
 
 const SAFE_SVG = `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
   <path fill="currentColor" d="M0 0h16v16H0z"/>

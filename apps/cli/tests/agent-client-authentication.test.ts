@@ -218,7 +218,7 @@ describe('AgentClient Kimi authentication and resume', () => {
           _meta: {
             'cognition.ai/subagentSupport': true,
             lody: {
-              elicitation: { version: 1, answerNotes: true },
+              elicitation: { version: 1, answerNotes: true, components: {version:1} },
               subagentEvents: { version: 1 },
             },
           },
@@ -233,7 +233,7 @@ describe('AgentClient Kimi authentication and resume', () => {
     expect(capabilities._meta).not.toHaveProperty('cognition.ai/subagentSupport');
     expect(capabilities).toMatchObject({
       elicitation: { form: {} },
-      _meta: { lody: { elicitation: { version: 1, answerNotes: true } } },
+      _meta: { lody: { elicitation: { version: 1, answerNotes: true, components: {version:1} } } },
     });
   });
 

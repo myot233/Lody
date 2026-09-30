@@ -6,7 +6,7 @@ description: 使用 ACP Registry 中的全部运行时，或添加你自己的 A
 # CLI 类型支持
 
 Lody 支持 [ACP Registry](https://agentclientprotocol.com/get-started/registry) 中发布的全部 CLI 运行类型。
-可选运行时会从 registry 动态加载，所以这篇文档不再单独维护一份静态厂商或命令列表。
+Agent 选择器包含 registry 条目和 Lody 支持的本地 ACP 运行时。
 
 <img src="/_docs-assets/0304-more-cli.png" alt="More CLI" />
 
@@ -23,9 +23,28 @@ Lody 支持 [ACP Registry](https://agentclientprotocol.com/get-started/registry)
 Registry 支持意味着 Lody 可以跟随上游新增的 ACP runtime。宿主机器仍然需要按对应 runtime
 自己的文档安装命令、完成登录、配置凭据和依赖。
 
+## Oh My Pi（OMP）
+
+在运行 Lody 的机器上安装并配置 [Oh My Pi](https://github.com/can1357/oh-my-pi)，确保 `omp` 在
+`PATH` 中。在 registry 支持的 Agent 选择器中选择 **Oh My Pi (OMP)**。Lody 使用本机安装的
+`omp acp` 启动，并通过 ACP 发现模型和模式。凭据和配置由 OMP 管理；Lody 不下载 OMP 运行时。
+
+在输入框键入 `/`，可以选择 OMP 通过 ACP 公布的命令，例如 `/model`，选中后可继续添加参数。
+Skill 和扩展命令在 OMP 公布后出现在菜单中；仅供终端界面使用的命令不在此列表内。
+修改 OMP 的命令或扩展后，刷新 Agent 配置的能力即可重新加载列表。
+
+Lody 识别 OMP 原生的项目目录 `.omp/skills`、用户目录 `~/.omp/agent/skills` 和
+`~/.omp/agent/managed-skills`，以及项目和用户级共享的 `.agent/skills`、`.agents/skills` 目录。
+这些映射对应默认目录，不自动推断自定义 OMP profile 或额外配置的 Skills 目录。
+
+
+原生 GUI 组件、协作、steering、原子提交计划和管理能力需要包含对应 ACP 扩展的 OMP 构建。
+固定的验收构建与源码补丁见 [OMP 接入 Spec](https://github.com/LodyAI/Lody/blob/main/specs/omp-native-acp.zh.md)。
+Lody 不会自动修改你本机的 OMP 安装。
+
 ## 自定义 ACP Agent
 
-如果你的 Agent 兼容 ACP，但尚未发布到 registry，可以在 **设置** -> **Agent 配置** 中选择 **Custom ACP**。
+如果你的 Agent 兼容 ACP，但未出现在选择器中，可以在 **设置** -> **Agent 配置** 中选择 **Custom ACP**。
 
 1. 填写配置名称。
 2. 将 **CLI Type** 设为 **Custom ACP**。

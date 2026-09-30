@@ -75,6 +75,7 @@ export * from './acp/tool-call-history';
 export * from './acp/history-apply';
 export * from './acp/history-replay-import';
 export * from './acp/ask-user-question';
+export * from './acp/component';
 export * from './acp/lody-rate-limit-migration';
 export * from './acp/skills';
 export * from './replay-prompt-builder';

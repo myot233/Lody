@@ -185,6 +185,24 @@ describe('project skills helpers', () => {
     expect(getSkillScanCandidateDirs()).not.toContain('.kimi/skills');
   });
 
+  it('filters OMP skills to its native and shared Agent Skills roots', () => {
+    const agents = [{ cliType: 'registry' as const, agentType: 'omp' }];
+
+    expect(isRegisteredSkillAgentType('omp')).toBe(true);
+    expect([...getRegisteredSkillDirs(agents)]).toEqual([
+      '.omp/skills',
+      '.agent/skills',
+      DEFAULT_PROJECT_SKILL_DIR,
+    ]);
+    expect([...getRegisteredGlobalSkillDirs(agents)]).toEqual([
+      '~/.omp/agent/skills',
+      '~/.omp/agent/managed-skills',
+      '~/.agent/skills',
+      DEFAULT_AGENTS_GLOBAL_SKILL_DIR,
+    ]);
+    expect(getRegisteredSystemSkillDirs(agents).size).toBe(0);
+  });
+
   it('registers every builtin agent type so none falls back to an unfiltered menu', () => {
     for (const { agentType } of BUILTIN_AGENTS) {
       expect(isRegisteredSkillAgentType(agentType)).toBe(true);

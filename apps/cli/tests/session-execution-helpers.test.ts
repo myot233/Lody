@@ -3,6 +3,20 @@ import { describe, expect, it } from 'vitest';
 import { buildPrompt } from '../src/session/session-execution-helpers';
 
 describe('session execution prompt helpers', () => {
+  it.each(['/native-gui', '/model fixture/test', '/skill:review preserve  spaces\nnext line'])(
+    'preserves runtime command input %j without injecting prompt guidance',
+    (input) => {
+      expect(
+        buildPrompt(
+          input,
+          { kind: 'github', repoFullName: 'owner/repo', branch: 'feature' },
+          [],
+          'synthetic-feedback'
+        )
+      ).toBe(input);
+    }
+  );
+
   it('replaces detailed Lody MCP guidance with a concise reminder', () => {
     const prompt = buildPrompt('inspect the UI');
 

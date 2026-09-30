@@ -752,6 +752,18 @@ describe('resolveBuiltinACPSetting', () => {
     });
   });
 
+  it('launches OMP through its native ACP command without a managed runtime', () => {
+    const resolved = resolveACPSetting({ cliType: 'registry', agentType: 'omp' });
+
+    expect(resolved).toEqual({
+      status: { agent: 'Oh My Pi (OMP)@local', command: 'omp' },
+      exec: { command: 'omp', args: ['acp'] },
+    });
+    expect(getAcpCapabilitySourceVersion({ cliType: 'registry', agentType: 'omp' })).toBe(
+      'omp@local'
+    );
+  });
+
   it('refreshes metadata when a registry uvx distribution is used', () => {
     const resolved = resolveRegistryAgentACPSetting({
       id: 'fast-agent',

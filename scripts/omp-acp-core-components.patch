@@ -1,0 +1,117 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 4778a04..eb35611 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -7,6 +7,8 @@
+   Equal durations, utilization, or reset times do not make windows duplicates.
+   Preserve compatibility with version 1 payloads that omit the label.
+ - Run `npm run build` and `npm run typecheck` when changing contracts.
++- GUI components are negotiated inert data on standard form elicitation. Bind
++  answers to component ID/revision; palettes and shortcuts remain component-local.
+ - Usage accounting uses cumulative `modelUsage` and optional already-included
+   `delta`; never add both. Keep token buckets disjoint and unknown cost omitted.
+   Adapters own deduplication/baselines; the shared accumulator is process-local.
+diff --git a/README.md b/README.md
+index 1aa90ee..cfa9b4c 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,25 @@ native execution identifiers to fresh opaque run IDs, preserves partial snapshot
+ drops output after termination, and marks disconnected executions unknown/incomplete.
+ Callers own negotiation, ordering, native ancestry and subscription lifetimes.
+ 
++## GUI components
++
++Clients supporting inert GUI documents advertise
++`_meta.lody.elicitation: {version: 1, components: {version: 1}}` alongside
++standard form elicitation. Agents then attach a `LodyComponentDocument` under
++the request's `_meta.lody.elicitation.component`. The form schema has exactly
++one required string property, `event`. An accepted answer serializes a
++`LodyComponentEvent` into that property; cancellation uses standard ACP cancel.
++
++Documents contain text, buttons, and text inputs, with an optional local palette
++and focused keybindings. They carry no HTML, script, executable URLs, or global
++client settings. The agent checks component ID and revision before native input
++delivery. Each interaction produces the next revision through another form;
++there is no background animation or unsolicited update channel in version 1.
++Consumers decline unsupported versions, malformed controls, invalid palettes,
++and incompatible event schemas. Lody bounds documents to 128 KiB of UTF-8 JSON,
++256 nodes, 128 bindings, and 4,096 characters per input. Native adapters own
++rendering, cancellation, disposal, and local session identity.
++
+ ## Design rules
+ 
+ - Use standard ACP whenever it can carry the behavior: `session/fork`,
+diff --git a/src/capabilities.ts b/src/capabilities.ts
+index 8e52be4..213542b 100644
+--- a/src/capabilities.ts
++++ b/src/capabilities.ts
+@@ -6,6 +6,8 @@ export type LodyVersionOneCapability = {
+ export type LodyElicitationCapability = LodyVersionOneCapability & {
+   /** Preserve a selection and its optional, separately keyed note end to end. */
+   answerNotes?: true;
++  /** Render inert component documents and return revision-bound input events. */
++  components?: { version: 1 };
+ };
+ 
+ /** Advertised under InitializeRequest.clientCapabilities._meta.lody. */
+diff --git a/src/elicitation.ts b/src/elicitation.ts
+index 5a4735e..a67a126 100644
+--- a/src/elicitation.ts
++++ b/src/elicitation.ts
+@@ -1,3 +1,5 @@
++import type { LodyComponentDocument } from './components.js';
++
+ /**
+  * Metadata for ACP form elicitation details that JSON Schema cannot express.
+  * The same shape is used at request, property, and enum-option scope; consumers
+@@ -35,6 +37,8 @@ export type LodyElicitationAnswer = string | string[];
+ 
+ export type LodyElicitationMeta = {
+   version: 1;
++  /** Request scope only; requires negotiated elicitation.components v1. */
++  component?: LodyComponentDocument;
+   autoResolveAfterSeconds?: number | null;
+   autoResolveAtEpochSeconds?: number;
+   /** Property scope: an alternative answer replacing the referenced selection. */
+diff --git a/src/index.ts b/src/index.ts
+index 5fdb070..84a097b 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,5 +1,6 @@
+ export * from './capabilities.js';
+ export * from './elicitation.js';
++export * from './components.js';
+ export * from './methods.js';
+ export * from './rate-limits.js';
+ export * from './session.js';
+diff --git a/src/components.ts b/src/components.ts
+new file mode 100644
+index 0000000..22009da
+--- /dev/null
++++ b/src/components.ts
+@@ -0,0 +1,25 @@
++/** Declarative, inert GUI content carried by standard ACP form elicitation. */
++export type LodyComponentNode =
++  | { type: 'text'; text: string }
++  | { type: 'button'; id: string; label: string; input: string }
++  | { type: 'input'; id: string; label: string };
++
++export type LodyComponentDocument = {
++  version: 1;
++  id: string;
++  revision: number;
++  title: string;
++  /** A component-local palette; never changes the client's application theme. */
++  theme?: { name: string; foreground: string; background: string; accent: string };
++  nodes: LodyComponentNode[];
++  /** Focus-scoped native key bindings. These never install global shortcuts. */
++  keybindings?: Array<{ key: string; label: string; input: string }>;
++};
++
++/** Serialized into the form's required `event` string property. */
++export type LodyComponentEvent = {
++  version: 1;
++  componentId: string;
++  revision: number;
++  input: string;
++};

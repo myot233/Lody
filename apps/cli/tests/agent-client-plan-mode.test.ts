@@ -1420,6 +1420,38 @@ describe('unstable_createElicitation (AskUserQuestion bridge)', () => {
     expect(onRequestPermission).not.toHaveBeenCalled();
   });
 
+  it.each(['true', 'false'])('round-trips an OMP confirmation as boolean %s', async (answer) => {
+    const { client, onRequestPermission } = createTestClient({ agentType: 'omp' });
+    onRequestPermission.mockResolvedValueOnce({
+      outcome: {
+        outcome: 'selected',
+        optionId: 'answer',
+        _meta: {
+          lody: { elicitation: { version: 1, answers: { value: answer } } },
+        },
+      },
+    } as Awaited<ReturnType<typeof onRequestPermission>>);
+    const result = await client.unstable_createElicitation({
+      mode: 'form',
+      sessionId: 'acp-test',
+      message: 'Proceed?',
+      requestedSchema: {
+        type: 'object',
+        properties: { value: { type: 'boolean' } },
+        required: ['value'],
+      },
+    });
+    expect(result).toEqual({ action: 'accept', content: { value: answer === 'true' } });
+    const request = (
+      onRequestPermission.mock.calls as unknown as [string, RequestPermissionRequest][]
+    )[0]?.[1];
+    expect(parseAskUserQuestionPermissionMeta(request?._meta)?.questions[0]).toMatchObject({
+      id: 'value',
+      question: 'Proceed?',
+      allowCustomAnswer: false,
+    });
+  });
+
   it('bridges Codex fields and folds an older renderer answer into the Core form', async () => {
     const { client, onRequestPermission } = createTestClient();
     onRequestPermission.mockResolvedValueOnce({

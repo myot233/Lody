@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
 import { createElement } from 'react';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { writeFile } from 'node:fs/promises';
+import {
+  parseAskUserQuestionPermissionMeta,
+  createAskUserQuestionPermissionOutcome,
+} from '@lody/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
@@ -513,3 +519,198 @@ describe('AskUserQuestionCard answer notes', () => {
     expect(container.querySelector('input')).toBeNull();
   });
 });
+
+describe('native component permission card', () => {
+  let root: Root;
+  let container: HTMLDivElement;
+  const component = {
+    version: 1 as const,
+    id: 'native-selector',
+    revision: 7,
+    title: 'Native selector',
+    theme: { name: 'fixture', foreground: '#123456', background: '#abcdef', accent: '#fedcba' },
+    nodes: [
+      { type: 'text' as const, text: '<script>window.executed = true</script>' },
+      { type: 'button' as const, id: 'confirm', label: 'Confirm selection', input: '\r' },
+      { type: 'input' as const, id: '__proto__', label: 'Search' },
+    ],
+    keybindings: [{ key: 'ctrl+j', label: 'Move down', input: '\n' }],
+  };
+  const componentMeta: AskUserQuestionPermissionMeta = {
+    source: 'lody',
+    version: 1,
+    allowCustomAnswer: true,
+    component,
+    questions: [
+      { id: 'event', header: 'Component', question: 'Input', options: [], multiSelect: false },
+    ],
+  };
+  const answers: AskUserQuestionAnswers[] = [];
+  const interactive = {
+    kind: 'interactive' as const,
+    isReady: true,
+    disabled: false,
+    isPendingSubmit: false,
+    isPendingCancel: false,
+    onSubmit: (value: AskUserQuestionAnswers) => answers.push(value),
+    onCancel: () => {},
+  };
+  beforeEach(async () => {
+    await initI18n('en');
+    answers.length = 0;
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+  afterEach(() => {
+    flushSync(() => root.unmount());
+    container.remove();
+  });
+  const render = (readonly = false) =>
+    flushSync(() =>
+      root.render(
+        createElement(AskUserQuestionCard, {
+          meta: componentMeta,
+          mode: readonly ? { kind: 'readonly', answers: {} } : interactive,
+        })
+      )
+    );
+  it('renders inert native text and returns the document-bound input', () => {
+    render();
+    expect(container.querySelector('pre')?.textContent).toContain('<script>');
+    expect(container.querySelector('script')).toBeNull();
+    flushSync(() => getButton(container, 'Confirm selection').click());
+    expect(JSON.parse(String(answers[0]?.event))).toEqual({
+      version: 1,
+      componentId: 'native-selector',
+      revision: 7,
+      input: '\r',
+    });
+  });
+  it('keeps shortcuts inside the focused component and yields to text input', () => {
+    render();
+    const region = container.querySelector<HTMLElement>('[role="region"]')!;
+    region.focus();
+    region.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'j', ctrlKey: true, bubbles: true, cancelable: true })
+    );
+    expect(JSON.parse(String(answers[0]?.event)).input).toBe('\n');
+    container
+      .querySelector('input')!
+      .dispatchEvent(new KeyboardEvent('keydown', { key: 'j', ctrlKey: true, bubbles: true }));
+    document.body.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'j', ctrlKey: true, bubbles: true })
+    );
+    expect(answers).toHaveLength(1);
+  });
+  it('disables historical component actions', () => {
+    render(true);
+    getButton(container, 'Confirm selection').click();
+    expect(container.querySelector('input')?.disabled).toBe(true);
+    expect(answers).toEqual([]);
+  });
+});
+
+// Opt-in bridge used by the native acceptance runner. The real permission card
+// renders every received native frame; its DOM actions produce the ACP reply.
+it.skipIf(!process.env.LODY_OMP_GUI_READY_FILE)(
+  'drives the real renderer for native OMP acceptance',
+  async () => {
+    await initI18n('en');
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    let finish: () => void = () => {};
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const handleRequest = async (request: IncomingMessage, response: ServerResponse) => {
+      try {
+        if (request.url === '/stop') {
+          response.end('{}');
+          finish();
+          return;
+        }
+        let body = '';
+        for await (const chunk of request) body += String(chunk);
+        if (body.length > 262_144) throw new Error('Oversized test input');
+        const nativeMeta = parseAskUserQuestionPermissionMeta(JSON.parse(body)._meta);
+        if (!nativeMeta?.component) throw new Error('Missing native component');
+        let answer: AskUserQuestionAnswers | undefined;
+        flushSync(() =>
+          root.render(
+            createElement(AskUserQuestionCard, {
+              meta: nativeMeta,
+              mode: {
+                kind: 'interactive',
+                isReady: true,
+                disabled: false,
+                isPendingSubmit: false,
+                isPendingCancel: false,
+                onSubmit: (value) => {
+                  answer = value;
+                },
+                onCancel: () => {},
+              },
+            })
+          )
+        );
+        const region = container.querySelector<HTMLElement>('[role="region"]')!;
+        const rendered = container.querySelector('pre')?.textContent;
+        const palette = region.getAttribute('style');
+        const accent = region.firstElementChild?.getAttribute('style');
+        if (nativeMeta.component.revision === 0) {
+          region.focus();
+          region.dispatchEvent(
+            new KeyboardEvent('keydown', {
+              key: 'j',
+              ctrlKey: true,
+              bubbles: true,
+              cancelable: true,
+            })
+          );
+        } else {
+          const confirm = nativeMeta.component.nodes.find(
+            (node) => node.type === 'button' && node.input === '\r'
+          );
+          if (!confirm || confirm.type !== 'button') throw new Error('Missing confirm action');
+          flushSync(() => getButton(container, confirm.label).click());
+        }
+        if (!answer) throw new Error('Renderer did not submit a native input');
+        response.setHeader('content-type', 'application/json');
+        response.end(
+          JSON.stringify({
+            outcome: createAskUserQuestionPermissionOutcome('answer', answer, nativeMeta),
+            proof: {
+              rendered,
+              palette,
+              accent,
+              revision: nativeMeta.component.revision,
+              theme: nativeMeta.component.theme,
+              keybindings: nativeMeta.component.keybindings,
+            },
+          })
+        );
+      } catch (error) {
+        response.statusCode = 500;
+        response.end(JSON.stringify({ error: String(error) }));
+      }
+    };
+    const server = createServer((request, response) => {
+      void handleRequest(request, response);
+    });
+    try {
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('Missing GUI driver address');
+      await writeFile(process.env.LODY_OMP_GUI_READY_FILE!, JSON.stringify({ port: address.port }));
+      await finished;
+    } finally {
+      flushSync(() => root.unmount());
+      container.remove();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+  300_000
+);

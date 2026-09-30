@@ -302,10 +302,13 @@ export function getRegistryAcpLaunchKind(
   return 'none';
 }
 
-export const LOCAL_REGISTRY_AGENT_TYPES = ['kimi', 'kimi-code', 'opencode'] as const;
+export const LOCAL_REGISTRY_AGENT_TYPES = ['kimi', 'kimi-code', 'omp', 'opencode'] as const;
 export type LocalRegistryAgentType = (typeof LOCAL_REGISTRY_AGENT_TYPES)[number];
 export const isLocalRegistryAgentType = (agentType: string): agentType is LocalRegistryAgentType =>
-  agentType === 'kimi' || agentType === 'kimi-code' || agentType === 'opencode';
+  agentType === 'kimi' ||
+  agentType === 'kimi-code' ||
+  agentType === 'omp' ||
+  agentType === 'opencode';
 
 /**
  * A single selectable value within a config option (flattened from grouped or flat lists).
@@ -359,7 +362,7 @@ export type AcpConfigOptionSummary = {
 };
 
 /**
- * Cached summary of an ACP AvailableCommand returned by Lody's NewSessionResponse extension.
+ * Cached summary of a command advertised by an ACP update or session-response extension.
  */
 export type AcpCommandSummary = {
   name: string;
@@ -371,7 +374,8 @@ export type AcpCommandSummary = {
 // Codex-only carry a bogus ladder for every agent that spells other variants
 // with the same brackets — a Claude probe stored `{ opus: ['1m'] }` — and the
 // per-model effort picker would rebuild that model's ladder from it.
-export const ACP_CAPABILITY_CACHE_VERSION = 9;
+// 10: collect standard command notifications, including agents with delayed bootstrap updates.
+export const ACP_CAPABILITY_CACHE_VERSION = 10;
 
 export type AcpCapabilityAuthority = 'unavailable' | 'provisional' | 'authoritative';
 

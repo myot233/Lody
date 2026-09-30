@@ -34,8 +34,8 @@ export type FetchedAcpCapabilities = AcpCapabilitiesResult & {
 };
 
 /**
- * Spawns a temporary ACP agent to discover the capabilities returned by session/new.
- * The agent is killed as soon as the NewSessionResponse has been normalized.
+ * Spawns a temporary ACP agent to discover session capabilities and slash commands.
+ * Agents may advertise commands in a notification after session/new returns.
  */
 export async function fetchAcpCapabilities(
   cliType: AgentConfigCliType,
@@ -80,6 +80,9 @@ export async function fetchAcpCapabilities(
     ? await mkdtemp(path.join(os.tmpdir(), 'lody-codex-verify-'))
     : undefined;
   const workdir = isolatedWorkdir ?? process.cwd();
+  const commandsBySession = new Map<string, AcpCapabilitiesResult['availableCommands']>();
+  let commandSessionId: string | undefined;
+  let onCommandsReceived: (() => void) | undefined;
   const { agentProcess, client, acpSessionId, sessionResponse, capabilitySourceVersion } =
     await startLocalAcpAgent({
       codexProfile: options.codexProfile,
@@ -94,7 +97,14 @@ export async function fetchAcpCapabilities(
       logger,
       terminalManager: noopTerminalManager,
       terminalEnabled: false,
-      onUpdateMessage: () => {},
+      onUpdateMessage: (message) => {
+        if (message.update.sessionUpdate !== 'available_commands_update') return;
+        commandsBySession.set(
+          message.sessionId,
+          message.update.availableCommands.map(({ name, description }) => ({ name, description }))
+        );
+        if (message.sessionId === commandSessionId) onCommandsReceived?.();
+      },
       onRequestPermission: async () => ({ outcome: { outcome: 'cancelled' } }),
     }).catch(async (error: unknown) => {
       if (isolatedWorkdir) await rm(isolatedWorkdir, { recursive: true, force: true });
@@ -102,6 +112,31 @@ export async function fetchAcpCapabilities(
     });
 
   try {
+    commandSessionId = acpSessionId;
+    const capabilities = normalizeAcpSessionCapabilities(sessionResponse, {
+      sessionFork: client.supportsSessionFork?.() === true,
+      sessionTitle: client.supportsSessionTitleGeneration(),
+      acknowledgedSteer: client.supportsAcknowledgedSteer(),
+      goalActions: client.getGoalCapability()?.actions.slice(),
+      agent: { cliType, agentType },
+    });
+    if (capabilities.availableCommands === undefined && !commandsBySession.has(acpSessionId)) {
+      // ACP has no end-of-bootstrap marker. Bound discovery for agents that never
+      // publish commands, while allowing delayed notifications such as OMP's.
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timeout);
+          options.signal?.removeEventListener('abort', finish);
+          onCommandsReceived = undefined;
+          resolve();
+        };
+        const timeout = setTimeout(finish, 1_000);
+        onCommandsReceived = finish;
+        options.signal?.addEventListener('abort', finish, { once: true });
+        if (options.signal?.aborted) finish();
+      });
+    }
+    options.signal?.throwIfAborted();
     if (options.verifyCodexCredential && options.codexProfile?.profile.profile.mode === 'api-key') {
       const key = options.codexProfile.candidateKey;
       if (!key) throw new Error('Codex credential verification requires a candidate key');
@@ -172,13 +207,8 @@ export async function fetchAcpCapabilities(
       }
     }
     return {
-      ...normalizeAcpSessionCapabilities(sessionResponse, {
-        sessionFork: client.supportsSessionFork?.() === true,
-        sessionTitle: client.supportsSessionTitleGeneration(),
-        acknowledgedSteer: client.supportsAcknowledgedSteer(),
-        goalActions: client.getGoalCapability()?.actions.slice(),
-        agent: { cliType, agentType },
-      }),
+      ...capabilities,
+      availableCommands: commandsBySession.get(acpSessionId) ?? capabilities.availableCommands,
       capabilitySourceVersion,
     };
   } finally {

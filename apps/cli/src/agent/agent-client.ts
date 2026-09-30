@@ -35,7 +35,7 @@ import {
   SessionId,
   type WorkspaceId,
   type ModelInfo,
-  parseAskUserQuestionElicitationRequest,
+  parseAcpFormElicitationRequest,
   buildAskUserQuestionElicitationResponse,
   formatMcpResolutionProblem,
   getServerNow,
@@ -796,15 +796,15 @@ export class AgentClient implements acp.Client {
    * elicitation rather than a permission request. Bridge it onto the existing
    * AskUserQuestion permission flow: parse the form back into question metadata,
    * synthesize the permission request the UI already renders, then fold the
-   * user's answers back into the elicitation response. Url-mode and non-question
-   * forms (e.g. arbitrary MCP elicitations) are declined — we only advertise
-   * form elicitation to re-enable AskUserQuestion.
+   * user's answers back into the elicitation response. Standard ACP string,
+   * choice and boolean forms use the same permission UI. Unsupported schema
+   * types and URL-mode forms are declined.
    */
   async unstable_createElicitation(
     params: acp.CreateElicitationRequest
   ): Promise<acp.CreateElicitationResponse> {
     if (!this.isKnownSubagentInteraction(params._meta)) return { action: 'decline' };
-    const elicitation = parseAskUserQuestionElicitationRequest(params);
+    const elicitation = parseAcpFormElicitationRequest(params);
     if (!elicitation) {
       this.logger.debug(
         `[${this.options.sessionId}] Declining unsupported elicitation (mode=${(params as { mode?: unknown }).mode})`
@@ -834,6 +834,7 @@ export class AgentClient implements acp.Client {
     const lodyElicitation = {
       version: 1,
       questions: elicitation.meta.questions,
+      ...(elicitation.meta.component ? { component: elicitation.meta.component } : {}),
       ...(autoResolveAtEpochSeconds !== undefined ? { autoResolveAtEpochSeconds } : {}),
     } satisfies LodyElicitationMeta;
     // Permission requests live in shared history and can be answered by a
@@ -1950,7 +1951,7 @@ export class AgentClient implements acp.Client {
               _meta: {
                 ...devinClientCapabilitiesMeta,
                 lody: {
-                  elicitation: { version: 1, answerNotes: true },
+                  elicitation: { version: 1, answerNotes: true, components: { version: 1 } },
                   subagentEvents: { version: 1 },
                 } satisfies LodyClientExtensionCapabilities,
               },

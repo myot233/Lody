@@ -6,8 +6,7 @@ description: Use every runtime available through the ACP Registry, or add your o
 # CLI Runtime Types
 
 Lody supports every CLI runtime published in the [ACP Registry](https://agentclientprotocol.com/get-started/registry).
-The available runtime list is loaded from the registry, so this page does not maintain a separate
-static list of vendors or commands.
+The Agent picker combines registry entries with local ACP runtimes supported by Lody.
 
 <img src="/_docs-assets/0304-more-cli.png" alt="More CLI" />
 
@@ -26,9 +25,32 @@ Registry support means Lody can follow new ACP runtime entries as they are added
 machine still needs the selected runtime's command, login, credentials, and dependencies installed
 according to that runtime's own documentation.
 
+## Oh My Pi (OMP)
+
+Install and configure [Oh My Pi](https://github.com/can1357/oh-my-pi) on the machine running
+Lody, and make sure `omp` is on its `PATH`. Choose **Oh My Pi (OMP)** from the registry-backed
+Agent picker. Lody starts `omp acp` using your local installation and discovers its models and
+modes over ACP. OMP owns its credentials and configuration; Lody does not download an OMP runtime.
+
+Type `/` in the composer to select commands advertised by OMP over ACP, such as `/model`.
+You can add arguments after selecting a command. Skill and extension commands appear when
+OMP advertises them; commands available only in its terminal UI are not included. After changing
+OMP's commands or extensions, refresh the Agent configuration's capabilities to reload the list.
+
+Lody recognizes OMP's native `.omp/skills` project directory and `~/.omp/agent/skills` and
+`~/.omp/agent/managed-skills` user directories, plus the shared `.agent/skills` and `.agents/skills`
+roots at project and user level. These are default directory mappings; custom OMP profiles and
+additional configured skill directories are not inferred.
+
+
+Native GUI components, collaboration, steering, atomic commit plans, and management need
+an OMP build with the corresponding ACP extensions. The pinned acceptance build and its
+source patches are documented in the [OMP integration Spec](https://github.com/LodyAI/Lody/blob/main/specs/omp-native-acp.md).
+Lody does not apply these patches to your local OMP installation.
+
 ## Custom ACP Agent
 
-If your agent is ACP-compatible but is not published in the registry, choose **Custom ACP** in
+If your ACP-compatible agent is not listed in the picker, choose **Custom ACP** in
 **Settings** -> **Agent Config**.
 
 1. Enter a name for the config.

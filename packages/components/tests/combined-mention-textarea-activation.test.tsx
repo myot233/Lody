@@ -194,6 +194,33 @@ describe('CombinedMentionTextarea mention enablement and activation', () => {
     }
   );
 
+  it('selects an OMP skill command and preserves its arguments as slash input', async () => {
+    vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame'] });
+    try {
+      await render({
+        value: '',
+        availableCommands: [
+          { name: 'model', description: 'Show or change the model' },
+          { name: 'skill:review', description: 'Review changes' },
+        ],
+      });
+      await typeInto('/skill:rev');
+      await act(async () => vi.advanceTimersToNextFrame());
+      expect(highlightedRowText()).toContain('Review changes');
+      await act(async () => {
+        textarea()!.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+        );
+      });
+      expect(textarea()!.value.trimEnd()).toBe('/skill:review');
+      await typeInto('/skill:review src/main.ts');
+      expect(textarea()!.value).toBe('/skill:review src/main.ts');
+      expect(document.querySelector('[data-slot="mention-item"]')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each(['@file:', '@', '@other:'])(
     'shows asynchronous file search state and commits %s results through the composer',
     async (prefix) => {

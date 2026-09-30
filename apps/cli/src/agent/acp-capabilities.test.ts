@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Logger } from '@/utils/logger';
 
@@ -66,11 +66,14 @@ function createSuccessfulStartupResult(sessionResponse?: Record<string, unknown>
 
 function mockStartupWithSessionResponse(sessionResponse: Record<string, unknown>) {
   mocks.startLocalAcpAgent.mockImplementation(async () =>
-    createSuccessfulStartupResult(sessionResponse)
+    createSuccessfulStartupResult({ availableCommands: [], ...sessionResponse })
   );
 }
 
 describe('fetchAcpCapabilities', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.probeBuiltinAuthentication.mockResolvedValue({ status: 'unknown' });
@@ -176,25 +179,124 @@ describe('fetchAcpCapabilities', () => {
     expect(result.acknowledgedSteer).toBe(true);
   });
 
-  it('uses commands from NewSessionResponse and ignores command update notifications', async () => {
+  it('uses the latest standard command update for the probed session', async () => {
     mocks.startLocalAcpAgent.mockImplementation(async (options) => {
       options.onUpdateMessage({
+        sessionId: 'acp-session-1',
         update: {
           sessionUpdate: 'available_commands_update',
-          availableCommands: [{ name: '/late', description: 'Late update' }],
+          availableCommands: [{ name: 'review', description: 'Stale command' }],
+        },
+      });
+      options.onUpdateMessage({
+        sessionId: 'acp-session-1',
+        update: {
+          sessionUpdate: 'available_commands_update',
+          availableCommands: [{ name: 'model', description: 'Show or change the model' }],
         },
       } as never);
+      options.onUpdateMessage({
+        sessionId: 'other-session',
+        update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
+      });
       return createSuccessfulStartupResult({
         sessionId: 'acp-session-1',
         availableCommands: [{ name: '/initial', description: 'Initial response' }],
       });
     });
 
-    const result = await fetchAcpCapabilities('registry', 'response-agent', createSilentLogger());
+    const result = await fetchAcpCapabilities('registry', 'omp', createSilentLogger());
 
     expect(result.availableCommands).toEqual([
-      { name: '/initial', description: 'Initial response' },
+      { name: 'model', description: 'Show or change the model' },
     ]);
+  });
+
+  it('waits for delayed OMP commands after session creation and ignores other sessions', async () => {
+    vi.useFakeTimers();
+    mocks.startLocalAcpAgent.mockImplementation(async (options) => {
+      setTimeout(() => {
+        options.onUpdateMessage({
+          sessionId: 'other-session',
+          update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
+        });
+      }, 25);
+      setTimeout(() => {
+        options.onUpdateMessage({
+          sessionId: 'acp-session-1',
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: [
+              { name: 'model', description: 'Show or change the model', input: { hint: 'model' } },
+              { name: 'skill:review', description: 'Review changes' },
+            ],
+          },
+        });
+      }, 50);
+      return createSuccessfulStartupResult({ sessionId: 'acp-session-1' });
+    });
+
+    const probe = fetchAcpCapabilities('registry', 'omp', createSilentLogger());
+    await vi.advanceTimersByTimeAsync(25);
+    expect(mocks.shutdownLocalAcpAgent).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(25);
+    expect((await probe).availableCommands).toEqual([
+      { name: 'model', description: 'Show or change the model' },
+      { name: 'skill:review', description: 'Review changes' },
+    ]);
+    expect(mocks.shutdownLocalAcpAgent).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('preserves an empty standard update instead of stale response commands', async () => {
+    mocks.startLocalAcpAgent.mockImplementation(async (options) => {
+      options.onUpdateMessage({
+        sessionId: 'acp-session-1',
+        update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
+      });
+      return createSuccessfulStartupResult();
+    });
+
+    const result = await fetchAcpCapabilities('registry', 'omp', createSilentLogger());
+    expect(result.availableCommands).toEqual([]);
+  });
+
+  it('bounds command discovery for agents that never advertise commands', async () => {
+    vi.useFakeTimers();
+    mocks.startLocalAcpAgent.mockResolvedValue(
+      createSuccessfulStartupResult({ sessionId: 'acp-session-1' })
+    );
+    const probe = fetchAcpCapabilities('registry', 'silent-agent', createSilentLogger());
+    await vi.advanceTimersByTimeAsync(999);
+    expect(mocks.shutdownLocalAcpAgent).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await probe).availableCommands).toBeUndefined();
+    expect(mocks.shutdownLocalAcpAgent).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('cancels delayed command discovery and cleans up without returning capabilities', async () => {
+    vi.useFakeTimers();
+    mocks.startLocalAcpAgent.mockResolvedValue(
+      createSuccessfulStartupResult({ sessionId: 'acp-session-1' })
+    );
+    const controller = new AbortController();
+    const reason = new Error('Cancelled capability refresh');
+    const probe = fetchAcpCapabilities(
+      'registry',
+      'omp',
+      createSilentLogger(),
+      undefined,
+      undefined,
+      undefined,
+      { signal: controller.signal }
+    );
+    const rejection = expect(probe).rejects.toBe(reason);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort(reason);
+    await rejection;
+    expect(mocks.shutdownLocalAcpAgent).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('preserves an explicit empty command list from NewSessionResponse', async () => {
@@ -209,12 +311,15 @@ describe('fetchAcpCapabilities', () => {
   });
 
   it('ignores a malformed NewSessionResponse command extension', async () => {
+    vi.useFakeTimers();
     mockStartupWithSessionResponse({
       sessionId: 'acp-session-1',
       availableCommands: [{ name: 123, description: 'invalid' }],
     });
 
-    const result = await fetchAcpCapabilities('registry', 'response-agent', createSilentLogger());
+    const probe = fetchAcpCapabilities('registry', 'response-agent', createSilentLogger());
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await probe;
 
     expect(result.availableCommands).toBeUndefined();
   });

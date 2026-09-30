@@ -63,6 +63,38 @@ type Story = StoryObj<typeof meta>;
 
 export const AnswerWithNote: Story = { render: (args) => <Interactive meta={args.meta} /> };
 export const Readonly: Story = {};
+export const NativeComponent: Story = {
+  render: (args) => <Interactive meta={args.meta} />,
+  args: {
+    meta: {
+      source: 'lody',
+      version: 1,
+      allowCustomAnswer: true,
+      questions: [
+        {
+          id: 'event',
+          header: 'Component',
+          question: 'Native selector',
+          multiSelect: false,
+          options: [],
+        },
+      ],
+      component: {
+        version: 1,
+        id: 'synthetic-selector',
+        revision: 2,
+        title: 'Native selector',
+        theme: { name: 'dark', foreground: '#c5c8c6', background: '#1d1f21', accent: '#81a2be' },
+        nodes: [
+          { type: 'text', text: 'Choose a workflow\n> Review\n  Implement' },
+          { type: 'button', id: 'confirm', label: 'Confirm', input: '\r' },
+          { type: 'input', id: 'filter', label: 'Filter' },
+        ],
+        keybindings: [{ key: 'ctrl+j', label: 'Next item', input: '\n' }],
+      },
+    },
+  },
+};
 export const SecretNote: Story = {
   args: {
     meta: {

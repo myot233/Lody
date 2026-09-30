@@ -9,7 +9,9 @@ import type {
   LodyElicitationMeta,
   LodyElicitationOption,
   LodyElicitationQuestion,
+  LodyComponentDocument,
 } from 'acp-extension-core';
+import { parseLodyComponentDocument, lodyComponentEventSchema } from './component';
 
 import type { PermissionOutcome } from '../message';
 
@@ -26,6 +28,7 @@ export type AskUserQuestionPermissionMeta = {
   questions: AskUserQuestion[];
   /** Absolute server-aligned time when the provider will continue without an answer. */
   autoResolveAt?: number;
+  component?: LodyComponentDocument;
 };
 
 export type AskUserQuestionAnswerValue = LodyElicitationAnswer;
@@ -94,11 +97,19 @@ function parseLodyElicitationPermissionMeta(
   if (!isRecord(raw) || raw.version !== 1 || !Array.isArray(raw.questions)) return null;
   const questions = parsePermissionQuestions(raw.questions);
   if (!questions) return null;
+  const component =
+    raw.component === undefined ? undefined : parseLodyComponentDocument(raw.component);
+  if (
+    raw.component !== undefined &&
+    (!component || questions.length !== 1 || questions[0]?.id !== 'event')
+  )
+    return null;
   return {
     source: 'lody',
     version: 1,
     allowCustomAnswer: questions.some((question) => question.allowCustomAnswer === true),
     questions,
+    ...(component ? { component } : {}),
     ...(typeof raw.autoResolveAtEpochSeconds === 'number' &&
     Number.isFinite(raw.autoResolveAtEpochSeconds)
       ? { autoResolveAt: raw.autoResolveAtEpochSeconds * 1000 }
@@ -489,6 +500,10 @@ export type AskUserQuestionElicitation = {
   fieldKeys: string[];
   customFieldKeys?: Array<string | undefined>;
   autoResolutionMs?: number | null;
+  /** Standard ACP boolean fields are presented as choices and restored on reply. */
+  booleanFieldKeys?: string[];
+  /** Untagged forms retain standard type/enum and required-field validation. */
+  standardForm?: { required: string[] };
 };
 
 type EnumOptionLike = {
@@ -577,6 +592,23 @@ export function parseAskUserQuestionElicitationRequest(
 
   const entries = Object.entries(schema.properties);
   const requestMeta = getLodyElicitationMeta(request._meta);
+  const component =
+    requestMeta?.component === undefined
+      ? undefined
+      : parseLodyComponentDocument(requestMeta.component);
+  if (
+    requestMeta?.component !== undefined &&
+    (!component ||
+      entries.length !== 1 ||
+      entries[0]?.[0] !== 'event' ||
+      !isRecord(entries[0]?.[1]) ||
+      !isFreeTextProperty(entries[0][1]) ||
+      Object.keys(entries[0][1]).some((key) => key !== 'type') ||
+      !Array.isArray(schema.required) ||
+      schema.required.length !== 1 ||
+      schema.required[0] !== 'event')
+  )
+    return null;
   const customFieldKeyByQuestionId = new Map<string, string>();
   const noteFieldKeyByQuestionId = new Map<string, string>();
   const associatedFields = new Set<string>();
@@ -686,6 +718,7 @@ export function parseAskUserQuestionElicitationRequest(
       version: 1,
       allowCustomAnswer,
       questions,
+      ...(component ? { component } : {}),
     },
     fieldKeys,
     ...(isLodyForm ? { customFieldKeys } : {}),
@@ -700,6 +733,98 @@ export function parseAskUserQuestionElicitationRequest(
         }
       : {}),
   };
+}
+
+/** Bridge standard ACP forms without requiring a provider's question metadata. */
+export function parseAcpFormElicitationRequest(
+  request: CreateElicitationRequest
+): AskUserQuestionElicitation | null {
+  if (!isRecord(request) || request.mode !== 'form') return null;
+  const schema = request.requestedSchema;
+  if (!isRecord(schema) || schema.type !== 'object' || !isRecord(schema.properties)) return null;
+  const schemaProperties = schema.properties;
+  const entries = Object.entries(schemaProperties);
+  // Explicit Core associations retain their validation and compatibility semantics.
+  // Never reinterpret an invalid or future Core form as an untagged standard form.
+  if (
+    getLodyMeta(request._meta)?.elicitation !== undefined ||
+    entries.some(([, prop]) => isRecord(prop) && getLodyMeta(prop._meta)?.elicitation !== undefined)
+  ) {
+    const tagged = [
+      getLodyMeta(request._meta)?.elicitation,
+      ...entries.map(([, prop]) =>
+        isRecord(prop) ? getLodyMeta(prop._meta)?.elicitation : undefined
+      ),
+    ].filter((meta) => meta !== undefined);
+    if (tagged.some((meta) => !isRecord(meta) || meta.version !== 1)) return null;
+    return parseAskUserQuestionElicitationRequest(request);
+  }
+  if (entries.length === 0 || entries.length > 32) return null;
+  if (
+    schema.required !== undefined &&
+    (!Array.isArray(schema.required) ||
+      schema.required.some(
+        (key) => typeof key !== 'string' || !Object.hasOwn(schemaProperties, key)
+      ))
+  )
+    return null;
+  const properties: Record<string, unknown> = Object.create(null);
+  const booleanFieldKeys: string[] = [];
+  for (const [key, prop] of entries) {
+    if (!key.trim() || !isRecord(prop)) return null;
+    const source = getEnumOptionSource(prop);
+    if (
+      !['string', 'boolean', 'array'].includes(String(prop.type)) ||
+      (prop.type === 'boolean' && source !== null) ||
+      (prop.type === 'array' && source === null) ||
+      (source !== null &&
+        (source.length === 0 || parseElicitationOptions(source).length !== source.length)) ||
+      ['title', 'description'].some(
+        (field) => prop[field] !== undefined && typeof prop[field] !== 'string'
+      ) ||
+      [
+        'pattern',
+        'format',
+        'minLength',
+        'maxLength',
+        'minItems',
+        'maxItems',
+        'allOf',
+        'anyOf',
+        'not',
+        '$ref',
+        'uniqueItems',
+      ].some((constraint) => prop[constraint] !== undefined)
+    )
+      return null;
+    // Each untagged field is independent; a suffix such as __other is not a
+    // cross-field association. This preserves OMP askDialog's original keys.
+    properties[key] = {
+      ...prop,
+      description: prop.title || prop.description || request.message,
+      ...(prop.type === 'boolean' ? { type: 'string', enum: ['true', 'false'] } : {}),
+    };
+    if (prop.type === 'boolean') booleanFieldKeys.push(key);
+  }
+  const parsed = parseAskUserQuestionElicitationRequest({
+    ...request,
+    requestedSchema: { ...schema, properties },
+    _meta: {
+      ...request._meta,
+      lody: { elicitation: { version: 1 } },
+    },
+  } as CreateElicitationRequest);
+  return parsed
+    ? {
+        ...parsed,
+        booleanFieldKeys,
+        standardForm: {
+          required: Array.isArray(schema.required)
+            ? schema.required.filter((key): key is string => typeof key === 'string')
+            : [],
+        },
+      }
+    : null;
 }
 
 /**
@@ -722,10 +847,12 @@ export function buildAskUserQuestionElicitationResponse(
     _meta: isRecord(outcome._meta) ? outcome._meta : null,
   });
   if (!answers) {
-    return { action: 'accept', content: {} };
+    return elicitation.standardForm?.required.length
+      ? { action: 'cancel' }
+      : { action: 'accept', content: {} };
   }
 
-  const content: Record<string, AskUserQuestionAnswerValue> = Object.create(null);
+  const content: Record<string, AskUserQuestionAnswerValue | boolean> = Object.create(null);
   elicitation.meta.questions.forEach((question, index) => {
     if (question.note) {
       const note = answers[question.note.fieldId];
@@ -735,6 +862,10 @@ export function buildAskUserQuestionElicitationResponse(
     if (!fieldKey) return;
     const value = answers[getAskUserQuestionAnswerKey(elicitation.meta.questions, index)];
     if (value === undefined) return;
+    if (elicitation.booleanFieldKeys?.includes(fieldKey)) {
+      if (value === 'true' || value === 'false') content[fieldKey] = value === 'true';
+      return;
+    }
     const customFieldKey = elicitation.customFieldKeys?.[index];
     const isCustomValue =
       typeof value === 'string' &&
@@ -743,5 +874,39 @@ export function buildAskUserQuestionElicitationResponse(
     content[isCustomValue && customFieldKey ? customFieldKey : fieldKey] = value;
   });
 
+  if (elicitation.standardForm) {
+    if (elicitation.standardForm.required.some((key) => !Object.hasOwn(content, key)))
+      return { action: 'cancel' };
+    for (const [index, question] of elicitation.meta.questions.entries()) {
+      const key = elicitation.fieldKeys[index];
+      if (!key || !Object.hasOwn(content, key) || elicitation.booleanFieldKeys?.includes(key))
+        continue;
+      const value = content[key];
+      if (question.multiSelect ? !Array.isArray(value) : typeof value !== 'string')
+        return { action: 'cancel' };
+      if (
+        question.options.length &&
+        (Array.isArray(value) ? value : [value]).some(
+          (answer) => !question.options.some(({ label }) => label === answer)
+        )
+      )
+        return { action: 'cancel' };
+    }
+  }
+  if (elicitation.meta.component) {
+    try {
+      const event = lodyComponentEventSchema.safeParse(
+        typeof content.event === 'string' ? JSON.parse(content.event) : undefined
+      );
+      if (
+        !event.success ||
+        event.data.componentId !== elicitation.meta.component.id ||
+        event.data.revision !== elicitation.meta.component.revision
+      )
+        return { action: 'cancel' };
+    } catch {
+      return { action: 'cancel' };
+    }
+  }
   return { action: 'accept', content };
 }

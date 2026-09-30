@@ -175,6 +175,15 @@ export const ACP_SKILL_DIRS_BY_AGENT_TYPE: Record<string, SkillDirsByAgentType> 
   neovate: skillDirs(['.neovate/skills'], ['~/.neovate/skills']),
   ona: skillDirs(['.ona/skills'], ['~/.ona/skills']),
   openclaw: skillDirs(['skills'], ['~/.openclaw/skills']),
+  omp: skillDirs(
+    ['.omp/skills', FACTORY_COMPAT_PROJECT_SKILL_DIR, DEFAULT_PROJECT_SKILL_DIR],
+    [
+      '~/.omp/agent/skills',
+      '~/.omp/agent/managed-skills',
+      '~/.agent/skills',
+      DEFAULT_AGENTS_GLOBAL_SKILL_DIR,
+    ]
+  ),
   opencode: skillDirs(
     [DEFAULT_PROJECT_SKILL_DIR, '.opencode/skills', CLAUDE_PROJECT_SKILL_DIR],
     ['~/.config/opencode/skills', CLAUDE_GLOBAL_SKILL_DIR, DEFAULT_AGENTS_GLOBAL_SKILL_DIR]
@@ -223,8 +232,9 @@ export const ACP_SKILL_DIRS_BY_AGENT_TYPE: Record<string, SkillDirsByAgentType> 
    v9: home scan also surfaces agent built-in `system` skills (codex
    `~/.codex/skills/.system`) under the new `'system'` scope.
    v10: grok is registered, and pi/kimi global dirs match their engines
-   (`~/.agents/skills` for both, `.kimi-code` for kimi's brand dirs). */
-export const KNOWN_SKILL_DIRS_VERSION = 10;
+   (`~/.agents/skills` for both, `.kimi-code` for kimi's brand dirs).
+   v11: OMP native and shared Agent Skills roots are registered. */
+export const KNOWN_SKILL_DIRS_VERSION = 11;
 
 export const DEFAULT_PROJECT_SKILLS_CONTENT_BUDGET_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_PROJECT_SKILLS_RESULT_MAX_SKILLS = 5_000;

@@ -94,6 +94,11 @@ const LOCAL_REGISTRY_AGENTS = {
     args: ['acp'],
     versionArgs: ['-v'],
   },
+  omp: {
+    command: 'omp',
+    args: ['acp'],
+    versionArgs: ['--version'],
+  },
   reasonix: {
     npx: {
       package: 'reasonix@1.7.0-rc.1',
@@ -115,6 +120,10 @@ const LOCAL_REGISTRY_AGENT_FALLBACKS = {
   },
   opencode: {
     name: 'OpenCode',
+  },
+  omp: {
+    name: 'Oh My Pi (OMP)',
+    description: 'Oh My Pi coding agent with native ACP support',
   },
   reasonix: {
     name: 'DeepSeek Reasonix',
@@ -238,7 +247,7 @@ function normalizeRegistryAgent(agent) {
   };
 }
 
-function normalizeLocalAgent(raw, id) {
+export function normalizeLocalAgent(raw, id) {
   const launcher = LOCAL_REGISTRY_AGENTS[id];
   if (!launcher) return null;
 

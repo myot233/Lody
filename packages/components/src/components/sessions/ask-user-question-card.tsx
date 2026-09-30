@@ -32,6 +32,7 @@ import { Tooltip } from '@/ui/armed-overlays';
 import { colors, shadow, sheen } from '@lody/ui/tokens/colors.stylex';
 import { corner, duration, ease, focus, radius, space, text } from '@lody/ui/tokens/scales.stylex';
 import { withClassName } from '@/lib/stylex';
+import { AgentComponentCard } from './agent-components/agent-component-card';
 
 const REDUCED_MOTION = '@media (prefers-reduced-motion: reduce)';
 const RING = `0 0 0 ${focus.ringWidth} ${colors.accent}`;
@@ -405,7 +406,19 @@ const isEditableSwipeTarget = (target: EventTarget | null): boolean =>
   target instanceof Element &&
   Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
 
-export function AskUserQuestionCard({ meta, mode, className }: AskUserQuestionCardProps) {
+export function AskUserQuestionCard(props: AskUserQuestionCardProps) {
+  return props.meta.component ? (
+    <AgentComponentCard
+      key={`${props.meta.component.id}:${props.meta.component.revision}`}
+      document={props.meta.component}
+      mode={props.mode}
+    />
+  ) : (
+    <StandardAskUserQuestionCard {...props} />
+  );
+}
+
+function StandardAskUserQuestionCard({ meta, mode, className }: AskUserQuestionCardProps) {
   const { t } = useTranslation();
   const isInteractive = mode.kind === 'interactive';
   const initialAnswers = mode.kind === 'readonly' ? mode.answers : undefined;

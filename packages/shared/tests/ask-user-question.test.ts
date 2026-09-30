@@ -13,8 +13,123 @@ import {
   getAskUserQuestionAnswerKey,
   isAskUserQuestionPermissionRequest,
   parseAskUserQuestionElicitationRequest,
+  parseAcpFormElicitationRequest,
   parseAskUserQuestionPermissionMeta,
 } from '../src/acp/ask-user-question';
+
+describe('standard ACP form bridge', () => {
+  const request = (properties: Record<string, unknown>): CreateElicitationRequest =>
+    ({
+      mode: 'form',
+      sessionId: 'standard-session',
+      message: 'Provide a value',
+      requestedSchema: { type: 'object', properties },
+    }) as CreateElicitationRequest;
+
+  it.each(['true', 'false'])(
+    'restores the boolean value %s without treating it as a string',
+    (answer) => {
+      const parsed = parseAcpFormElicitationRequest(request({ value: { type: 'boolean' } }));
+      expect(parsed?.meta.questions[0]).toMatchObject({
+        id: 'value',
+        allowCustomAnswer: false,
+        options: [{ label: 'true' }, { label: 'false' }],
+      });
+      if (!parsed) throw new Error('Expected a standard form');
+      expect(
+        buildAskUserQuestionElicitationResponse(parsed, {
+          outcome: createAskUserQuestionPermissionOutcome('answer', { value: answer }, parsed.meta),
+        })
+      ).toEqual({ action: 'accept', content: { value: answer === 'true' } });
+      expect(
+        buildAskUserQuestionElicitationResponse(parsed, { outcome: { outcome: 'cancelled' } })
+      ).toEqual({ action: 'cancel' });
+    }
+  );
+
+  it('preserves free-text fields and OMP multi-select/custom field identities', () => {
+    const parsed = parseAcpFormElicitationRequest(
+      request({
+        q0: {
+          type: 'array',
+          title: 'Which checks?',
+          items: {
+            anyOf: [
+              { const: 'Types', title: 'Types' },
+              { const: 'Tests', title: 'Tests' },
+            ],
+          },
+        },
+        q0__other: { type: 'string', title: 'Other checks' },
+        comment: { type: 'string', title: 'Comment' },
+      })
+    );
+    expect(parsed?.meta.questions.map(({ id, question }) => ({ id, question }))).toEqual([
+      { id: 'q0', question: 'Which checks?' },
+      { id: 'q0__other', question: 'Other checks' },
+      { id: 'comment', question: 'Comment' },
+    ]);
+    if (!parsed) throw new Error('Expected a standard form');
+    const answers = { q0: ['Types', 'Tests'], q0__other: 'Lint', comment: 'Ready' };
+    expect(
+      buildAskUserQuestionElicitationResponse(parsed, {
+        outcome: createAskUserQuestionPermissionOutcome('answer', answers, parsed.meta),
+      })
+    ).toEqual({ action: 'accept', content: answers });
+  });
+
+  it.each([
+    { value: { type: 'number' } },
+    { value: { type: 'string', pattern: '^yes$' } },
+    { value: { type: 'array', items: { type: 'string' } } },
+    { value: { type: 'string', enum: [1] } },
+    { value: { type: 'boolean', enum: ['yes'] } },
+    { value: { type: 'string', enum: [] } },
+    { value: { type: 'string', title: { nested: 'bad' } } },
+    { value: { type: 'string', allOf: [{ const: 'A' }] } },
+    { '': { type: 'string' } },
+  ])('declines unsupported schemas rather than silently dropping fields %#', (properties) => {
+    expect(parseAcpFormElicitationRequest(request(properties))).toBeNull();
+  });
+
+  it('does not bypass malformed Core associations with a standard-form fallback', () => {
+    expect(
+      parseAcpFormElicitationRequest(
+        request({
+          value: { type: 'string', enum: ['A', 'B'] },
+          note: {
+            type: 'string',
+            _meta: { lody: { elicitation: { version: 2, noteFor: 'value' } } },
+          },
+        })
+      )
+    ).toBeNull();
+    expect(
+      parseAcpFormElicitationRequest({
+        ...request({ value: { type: 'string', enum: ['A', 'B'] } }),
+        _meta: { lody: { elicitation: { version: 2 } } },
+      })
+    ).toBeNull();
+  });
+  it('cancels incomplete required forms and invalid enum answers', () => {
+    const parsed = parseAcpFormElicitationRequest({
+      ...request({ value: { type: 'string', enum: ['A', 'B'] } }),
+      requestedSchema: {
+        type: 'object',
+        properties: { value: { type: 'string', enum: ['A', 'B'] } },
+        required: ['value'],
+      },
+    });
+    if (!parsed) throw new Error('Expected a standard form');
+    for (const answers of [{}, { value: 'C' }]) {
+      expect(
+        buildAskUserQuestionElicitationResponse(parsed, {
+          outcome: createAskUserQuestionPermissionOutcome('answer', answers, parsed.meta),
+        })
+      ).toEqual({ action: 'cancel' });
+    }
+  });
+});
 
 describe('AskUserQuestion permission metadata', () => {
   const meta = {
@@ -928,5 +1043,78 @@ describe('Core answer notes', () => {
       })
     ).toBeNull();
     expect(extractAskUserQuestionAnswersFromOutcome(parsed.meta, outcome)).toBeNull();
+  });
+});
+
+describe('Core GUI component boundary', () => {
+  const component = {
+    version: 1,
+    id: 'selector',
+    revision: 3,
+    title: 'Native selector',
+    theme: { name: 'dark', foreground: '#123456', background: '#abcdef', accent: '#fedcba' },
+    nodes: [
+      { type: 'text', text: 'Native text' },
+      { type: 'button', id: 'ok', label: 'Confirm', input: '\r' },
+    ],
+    keybindings: [{ key: 'ctrl+j', label: 'Down', input: '\n' }],
+  };
+  const request = (
+    doc: unknown,
+    property: unknown = { type: 'string' }
+  ): CreateElicitationRequest =>
+    ({
+      mode: 'form',
+      sessionId: 'owned-session',
+      message: 'Native selector',
+      requestedSchema: { type: 'object', properties: { event: property }, required: ['event'] },
+      _meta: { lody: { elicitation: { version: 1, component: doc } } },
+    }) as CreateElicitationRequest;
+  it('preserves the component and its exact event envelope through the permission bridge', () => {
+    const parsed = parseAcpFormElicitationRequest(request(component));
+    expect(parsed?.meta.component).toEqual(component);
+    if (!parsed) throw new Error('Expected component form');
+    const event = JSON.stringify({ version: 1, componentId: 'selector', revision: 3, input: '\r' });
+    expect(
+      buildAskUserQuestionElicitationResponse(parsed, {
+        outcome: createAskUserQuestionPermissionOutcome('answer', { event }, parsed.meta),
+      })
+    ).toEqual({ action: 'accept', content: { event } });
+  });
+  it.each([
+    { ...component, version: 2 },
+    { ...component, theme: { ...component.theme, background: 'url(https://invalid.example)' } },
+    { ...component, nodes: [{ type: 'html', html: '<script />' }] },
+    {
+      ...component,
+      nodes: [
+        { type: 'input', id: 'duplicate', label: 'A' },
+        { type: 'input', id: 'duplicate', label: 'B' },
+      ],
+    },
+    { ...component, nodes: [{ type: 'text', text: '界'.repeat(50_000) }] },
+  ])('declines malformed or oversized component documents', (doc) => {
+    expect(parseAcpFormElicitationRequest(request(doc))).toBeNull();
+  });
+  it.each([
+    'not JSON',
+    JSON.stringify({ version: 1, componentId: 'other', revision: 3, input: 'wrong' }),
+    JSON.stringify({ version: 1, componentId: 'selector', revision: 2, input: 'stale' }),
+    JSON.stringify({ version: 2, componentId: 'selector', revision: 3, input: 'future' }),
+  ])('cancels invalid or stale component answers', (event) => {
+    const parsed = parseAcpFormElicitationRequest(request(component));
+    if (!parsed) throw new Error('Missing component');
+    expect(
+      buildAskUserQuestionElicitationResponse(parsed, {
+        outcome: createAskUserQuestionPermissionOutcome('answer', { event }, parsed.meta),
+      })
+    ).toEqual({ action: 'cancel' });
+  });
+  it.each([
+    { type: 'boolean' },
+    { type: 'string', default: 'injected' },
+    { type: 'string', enum: ['wrong'] },
+  ])('declines incompatible event fields', (prop) => {
+    expect(parseAcpFormElicitationRequest(request(component, prop))).toBeNull();
   });
 });

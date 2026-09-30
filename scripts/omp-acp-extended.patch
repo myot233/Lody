@@ -1,0 +1,2841 @@
+diff --git a/bun.lock b/bun.lock
+index 4a9bd72..8b1e61e 100644
+--- a/bun.lock
++++ b/bun.lock
+@@ -104,6 +104,7 @@
+         "@opentelemetry/sdk-metrics": "catalog:",
+         "@opentelemetry/sdk-trace-base": "catalog:",
+         "@opentelemetry/sdk-trace-node": "catalog:",
++        "acp-extension-core": "0.1.8",
+         "axe-core": "4.13.0",
+         "puppeteer-core": "catalog:",
+       },
+@@ -1017,6 +1018,8 @@
+ 
+     "@typescript/vfs": ["@typescript/vfs@1.6.1", "", { "dependencies": { "debug": "^4.1.1" }, "peerDependencies": { "typescript": "*" } }, "sha512-JwoxboBh7Oz1v38tPbkrZ62ZXNHAk9bJ7c9x0eI5zBfBnBYGhURdbnh7Z4smN/MV48Y5OCcZb58n972UtbazsA=="],
+ 
++    "acp-extension-core": ["acp-extension-core@0.1.8", "", {}, "sha512-ngcIWck9aEN4i/OxnRgNiBPWFEFc3EXjcjPKoT8KHBZj+AgFjiX0Uc6t/WEK48JAnLc9M7fUAjzOBb2PangGug=="],
++
+     "adm-zip": ["adm-zip@0.5.18", "", {}, "sha512-ufJnssQGbxzLNS1Ho9bCtX4rQKCCvoVuDLHoJyc3F9dOGDB4BkWs2Ci0kv53lqocAEQ/Cbi+I2XCsNYGqVYqng=="],
+ 
+     "ansi-regex": ["ansi-regex@6.3.0", "", {}, "sha512-WpDfL7NO6j7tH88IDBNVdUJxDh9nmCteAVW9dsep846XdwF4naCBK+/tGLX3KJgcpgMRXCFlTM2hKGoK9FsdrQ=="],
+diff --git a/packages/agent/src/agent.ts b/packages/agent/src/agent.ts
+index d5b2acf..0512886 100644
+--- a/packages/agent/src/agent.ts
++++ b/packages/agent/src/agent.ts
+@@ -1230,6 +1230,31 @@ export class Agent {
+ 		this.#notifySteeringWaiters();
+ 	}
+ 
++	/** Withdraw one owner-scoped steer. False means it already left the pending queue. */
++	withdrawSteeringMessage(message: AgentMessage): boolean {
++		let queued = this.#steeringQueue.includes(message);
++		this.#steeringQueue = this.#steeringQueue.filter(item => item !== message);
++		const claim = this.#queuedMessageClaims.steering;
++		if (claim?.messages.includes(message)) {
++			queued = true;
++			claim.messages = claim.messages.filter(item => item !== message);
++			this.#cancelQueuedMessagePreparation("steering", true);
++		}
++		for (const delivery of this.#queuedMessageDeliveries) {
++			if (delivery.queue !== "steering") continue;
++			const remaining = delivery.messages.slice(delivery.next).filter(item => item !== message);
++			if (remaining.length === delivery.messages.length - delivery.next) continue;
++			if (remaining.length === 0) this.#queuedMessageDeliveries.delete(delivery);
++			else {
++				delivery.messages = remaining;
++				delivery.next = 0;
++			}
++		}
++		this.#liveSteered = this.#liveSteered.filter(entry => entry.message !== message);
++		this.#notifySteeringWaiters();
++		return queued;
++	}
++
+ 	/**
+ 	 * Queue a follow-up message to be processed after the agent finishes.
+ 	 * Delivered only when agent has no more tool calls or steering messages.
+diff --git a/packages/agent/test/agent.test.ts b/packages/agent/test/agent.test.ts
+index 5723116..0fbdb96 100644
+--- a/packages/agent/test/agent.test.ts
++++ b/packages/agent/test/agent.test.ts
+@@ -16,6 +16,19 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
+ import { createAssistantMessage, createUserMessage } from "./helpers";
+ 
+ describe("Agent", () => {
++	it("withdraws only the pending steer owned by the caller", () => {
++		const agent = new Agent();
++		const first = createUserMessage("keep steer");
++		const cancelled = createUserMessage("cancel steer");
++		const followUp = createUserMessage("keep follow-up");
++		agent.steer(first);
++		agent.steer(cancelled);
++		agent.followUp(followUp);
++		expect(agent.withdrawSteeringMessage(cancelled)).toBe(true);
++		expect(agent.peekSteeringQueue()).toEqual([first]);
++		expect(agent.peekFollowUpQueue()).toEqual([followUp]);
++		expect(agent.withdrawSteeringMessage(cancelled)).toBe(false);
++	});
+ 	it("classifies agent-authored steering as a parent steering message", async () => {
+ 		const toolSchema = type({ value: type("string") });
+ 		const executed: string[] = [];
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index fb66193..acc0d0e 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -2,6 +2,15 @@
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- ACP exposes native management and speech catalogs through `/omp`, reviewed atomic plans through `/commit-plan`, and encrypted collaboration through `/collab`, `/join`, and `/leave`. Hosts accept guest prompts only during an owning `/collab watch` turn.
++- Negotiated Core GUI components present native custom widgets, local themes, and focused keybindings through versioned form frames. ACP steering acknowledges injection into the current native turn and withdraws canceled queued inputs.
++
++### Fixed
++
++- ACP sessions now advertise and run prompts from client-provided MCP servers as slash commands, including prompts arriving after server startup. Reconfiguring a session clears stale prompt commands.
++
+ ## [18.4.3] - 2026-09-28
+ 
+ ### Added
+diff --git a/packages/coding-agent/package.json b/packages/coding-agent/package.json
+index f5da7c1..760fb74 100644
+--- a/packages/coding-agent/package.json
++++ b/packages/coding-agent/package.json
+@@ -15,7 +15,10 @@
+ 		"url": "https://github.com/can1357/oh-my-pi/issues"
+ 	},
+ 	"license": "MIT",
+-	"author": { "name": "Stencil Labs, Inc.", "url": "https://stencil.so" },
++	"author": {
++		"name": "Stencil Labs, Inc.",
++		"url": "https://stencil.so"
++	},
+ 	"contributors": [
+ 		"Mario Zechner"
+ 	],
+@@ -559,6 +562,7 @@
+ 		"@opentelemetry/sdk-metrics": "catalog:",
+ 		"@opentelemetry/sdk-trace-base": "catalog:",
+ 		"@opentelemetry/sdk-trace-node": "catalog:",
++		"acp-extension-core": "0.1.8",
+ 		"axe-core": "4.13.0",
+ 		"puppeteer-core": "catalog:"
+ 	},
+diff --git a/packages/coding-agent/src/capability/index.ts b/packages/coding-agent/src/capability/index.ts
+index a8494e0..830068a 100644
+--- a/packages/coding-agent/src/capability/index.ts
++++ b/packages/coding-agent/src/capability/index.ts
+@@ -301,7 +301,7 @@ async function loadImpl<T>(
+  */
+ function filterProviders<T>(capability: Capability<T>, options: LoadOptions<T>): Provider<T>[] {
+ 	const disabled = disabledProviders();
+-	let providers = (capability.providers as Provider<T>[]).filter(p => !disabled.has(p.id));
++	let providers = (capability.providers as Provider<T>[]).filter(p => options.includeDisabled || !disabled.has(p.id));
+ 
+ 	if (options.providers) {
+ 		const allowed = new Set(options.providers);
+diff --git a/packages/coding-agent/src/collab/display-name.ts b/packages/coding-agent/src/collab/display-name.ts
+index cdf2c09..d2e9834 100644
+--- a/packages/coding-agent/src/collab/display-name.ts
++++ b/packages/coding-agent/src/collab/display-name.ts
+@@ -4,7 +4,7 @@ import type { InteractiveModeContext } from "../modes/types";
+ import { cfgCollabDisplayName } from "./settings";
+ 
+ /** Display name for this process's user in collab sessions. */
+-export function collabDisplayName(ctx: InteractiveModeContext): string {
++export function collabDisplayName(ctx: Pick<InteractiveModeContext, "settings">): string {
+ 	const configured = cfgCollabDisplayName.get(ctx.settings).trim();
+ 	if (configured) return configured;
+ 	try {
+diff --git a/packages/coding-agent/src/collab/host.ts b/packages/coding-agent/src/collab/host.ts
+index e08341c..3363ad5 100644
+--- a/packages/coding-agent/src/collab/host.ts
++++ b/packages/coding-agent/src/collab/host.ts
+@@ -182,8 +182,28 @@ export class CollabHostStoppedError extends Error {
+ 	}
+ }
+ 
++/** Native host dependencies shared by the terminal and headless ACP adapters. */
++export type CollabHostContext = Pick<
++	InteractiveModeContext,
++	| "session"
++	| "sessionManager"
++	| "settings"
++	| "showStatus"
++	| "eventBus"
++	| "subagentEventBus"
++	| "collabHost"
++	| "updatePendingMessagesDisplay"
++> & {
++	ui: Pick<InteractiveModeContext["ui"], "requestRender">;
++	statusLine: {
++		setCollabStatus: InteractiveModeContext["statusLine"]["setCollabStatus"];
++		invalidate(): void;
++		getCachedContextBreakdown(): { usedTokens?: number; contextWindow: number };
++	};
++};
++
+ export class CollabHost {
+-	#ctx: InteractiveModeContext;
++	#ctx: CollabHostContext;
+ 	#socket: CollabSocket | null = null;
+ 	#link = "";
+ 	#webLink = "";
+@@ -234,7 +254,7 @@ export class CollabHost {
+ 	#stopDone: Promise<void> | undefined;
+ 	#stopped = false;
+ 
+-	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
++	constructor(ctx: CollabHostContext, options: CollabHostOptions = {}) {
+ 		this.#ctx = ctx;
+ 		this.#instanceId = options.instanceId ?? randomBytes(8).toString("hex");
+ 		this.#generation = options.generation ?? 1;
+diff --git a/packages/coding-agent/src/commit/agentic/index.ts b/packages/coding-agent/src/commit/agentic/index.ts
+index 43f7d74..0c8ff3e 100644
+--- a/packages/coding-agent/src/commit/agentic/index.ts
++++ b/packages/coding-agent/src/commit/agentic/index.ts
+@@ -24,6 +24,9 @@ interface CommitExecutionContext {
+ 	cwd: string;
+ 	dryRun: boolean;
+ 	push: boolean;
++	output?: (text: string) => Promise<void> | void;
++	confirm?: (plan: SplitCommitPlan) => Promise<boolean>;
++	signal?: AbortSignal;
+ }
+ 
+ export async function runAgenticCommit(args: CommitCommandArgs): Promise<{ usedFallback: boolean }> {
+@@ -258,13 +261,18 @@ async function runSingleCommit(proposal: CommitProposal, ctx: CommitExecutionCon
+ 	if (ctx.push) await pushOrAbort(ctx.cwd);
+ }
+ 
+-async function runSplitCommit(
++export async function runSplitCommit(
+ 	plan: SplitCommitPlan,
+ 	ctx: CommitExecutionContext & { additionalFiles?: string[] },
+ ): Promise<void> {
++	const output =
++		ctx.output ??
++		((text: string) => {
++			process.stdout.write(text);
++		});
+ 	const repo = vcs.requireGit(ctx.cwd);
+ 	if (plan.warnings.length > 0) {
+-		process.stdout.write(formatWarnings(plan.warnings));
++		await output(formatWarnings(plan.warnings));
+ 	}
+ 	if (ctx.additionalFiles && ctx.additionalFiles.length > 0) {
+ 		appendFilesToLastCommit(plan, ctx.additionalFiles);
+@@ -278,7 +286,7 @@ async function runSplitCommit(
+ 	}
+ 
+ 	if (ctx.dryRun) {
+-		process.stdout.write("\nSplit commit plan (dry run):\n");
++		await output("\nSplit commit plan (dry run):\n");
+ 		for (const [index, commit] of plan.commits.entries()) {
+ 			const analysis: ConventionalAnalysis = {
+ 				type: commit.type,
+@@ -287,15 +295,16 @@ async function runSplitCommit(
+ 				issueRefs: commit.issueRefs,
+ 			};
+ 			const message = formatCommitMessage(analysis, commit.summary);
+-			process.stdout.write(`Commit ${index + 1}:\n${message}\n`);
++			await output(`Commit ${index + 1}:\n${message}\n`);
+ 			const changeSummary = commit.changes.map(change => formatFileChangeSummary(change.path, change)).join(", ");
+-			process.stdout.write(`Changes: ${changeSummary}\n`);
++			await output(`Changes: ${changeSummary}\n`);
+ 		}
+ 		return;
+ 	}
+ 
+-	if (!(await confirmSplitCommitPlan(plan))) {
+-		process.stdout.write("Split commit aborted by user.\n");
++	const stagedDiff = await repo.diffText({ cached: true, binary: true });
++	if (!(await (ctx.confirm ?? confirmSplitCommitPlan)(plan))) {
++		await output("Split commit aborted by user.\n");
+ 		return;
+ 	}
+ 
+@@ -304,10 +313,14 @@ async function runSplitCommit(
+ 		throw new Error(order.error);
+ 	}
+ 
+-	process.stdout.write("● Creating split commits...\n");
+-	const stagedDiff = await repo.diffText({ cached: true, binary: true });
++	await output("● Creating split commits...\n");
++	ctx.signal?.throwIfAborted();
++	if (stagedDiff !== (await repo.diffText({ cached: true, binary: true }))) {
++		throw new Error("Staged changes changed while the commit plan was awaiting approval");
++	}
+ 	await repo.unstage([]);
+ 	for (const [position, commitIndex] of order.entries()) {
++		ctx.signal?.throwIfAborted();
+ 		const commit = plan.commits[commitIndex];
+ 		await repo.stageHunks(commit.changes, stagedDiff);
+ 		const analysis: ConventionalAnalysis = {
+@@ -332,7 +345,7 @@ async function runSplitCommit(
+ 		}
+ 		await repo.unstage([]);
+ 	}
+-	process.stdout.write("Split commits created.\n");
++	await output("Split commits created.\n");
+ 	if (ctx.push) await pushOrAbort(ctx.cwd);
+ }
+ 
+diff --git a/packages/coding-agent/src/commit/agentic/tools/split-commit.ts b/packages/coding-agent/src/commit/agentic/tools/split-commit.ts
+index 58f63f5..b3d4d68 100644
+--- a/packages/coding-agent/src/commit/agentic/tools/split-commit.ts
++++ b/packages/coding-agent/src/commit/agentic/tools/split-commit.ts
+@@ -12,7 +12,7 @@ import {
+ } from "../../../commit/agentic/validation";
+ import { validateScope } from "../../../commit/analysis/validation";
+ import { normalizeDetails } from "../../../commit/utils";
+-import type { CustomTool } from "../../../extensibility/custom-tools/types";
++import type { AgentToolResult, CustomTool } from "../../../extensibility/custom-tools/types";
+ import { commitTypeSchema, detailSchema } from "./schemas.js";
+ 
+ const fileChangeSchema = type({ path: "string", kind: "'all'" })
+@@ -46,134 +46,145 @@ export function createSplitCommitTool(
+ 	state: CommitAgentState,
+ 	changelogTargets: string[],
+ ): CustomTool<typeof splitCommitSchema> {
+-	const repo = vcs.requireGit(cwd);
+ 	return {
+ 		name: "split_commit",
+ 		label: "Split Commit",
+ 		description: "Propose multiple atomic commits for unrelated changes.",
+ 		parameters: splitCommitSchema,
+ 		async execute(_toolCallId, params) {
+-			const stagedFiles = state.overview?.files ?? (await repo.changedFiles({ cached: true }));
+-			const stagedSet = new Set(stagedFiles);
+-			const changelogSet = new Set(changelogTargets);
+-			const usedFiles = new Set<string>();
+-			const errors: string[] = [];
+-			const warnings: string[] = [];
+-			const diffText = await repo.diffText({ cached: true });
+-
+-			const commits: SplitCommitGroup[] = params.commits.map((commit, index) => {
+-				const scope = commit.scope?.trim() || null;
+-				const summary = normalizeSummary(commit.summary, commit.type, scope);
+-				const detailInput = normalizeDetails(commit.details ?? []);
+-				const detailResult = capDetails(detailInput);
+-				warnings.push(...detailResult.warnings.map(warning => `Commit ${index + 1}: ${warning}`));
+-				const issueRefs = commit.issue_refs ?? [];
+-				const dependencies = (commit.dependencies ?? []).map(dep => Math.floor(dep));
+-				const changes = commit.changes.map(change => ({
+-					path: change.path,
+-					kind: change.kind,
+-					indices: change.kind === "indices" ? change.indices : undefined,
+-					start: change.kind === "lines" ? change.start : undefined,
+-					end: change.kind === "lines" ? change.end : undefined,
+-				}));
+-				const files = changes.map(change => change.path);
+-
+-				const summaryValidation = validateSummaryRules(summary);
+-				const scopeValidation = validateScope(scope);
+-				const typeValidation = validateTypeConsistency(commit.type, files, {
+-					diffText,
+-					summary,
+-					details: detailResult.details,
+-				});
+-
+-				if (summaryValidation.errors.length > 0) {
+-					errors.push(...summaryValidation.errors.map(error => `Commit ${index + 1}: ${error}`));
+-				}
+-				if (!scopeValidation.valid) {
+-					errors.push(...scopeValidation.errors.map(error => `Commit ${index + 1}: ${error}`));
+-				}
+-				if (typeValidation.errors.length > 0) {
+-					errors.push(...typeValidation.errors.map(error => `Commit ${index + 1}: ${error}`));
+-				}
+-				warnings.push(...summaryValidation.warnings.map(warning => `Commit ${index + 1}: ${warning}`));
+-				warnings.push(...typeValidation.warnings.map(warning => `Commit ${index + 1}: ${warning}`));
+-				const hunkValidation = validateHunkSelectors(index, changes, files, diffText);
+-				warnings.push(...hunkValidation.warnings);
+-				errors.push(...hunkValidation.errors);
+-				errors.push(...validateDependencies(index, dependencies, params.commits.length));
+-
+-				return {
+-					changes,
+-					type: commit.type,
+-					scope,
+-					summary,
+-					details: detailResult.details,
+-					issueRefs,
+-					rationale: commit.rationale?.trim() || undefined,
+-					dependencies,
+-				};
+-			});
+-
+-			for (const commit of commits) {
+-				const seen = new Set<string>();
+-				for (const change of commit.changes) {
+-					const file = change.path;
+-					if (!stagedSet.has(file) && !changelogSet.has(file)) {
+-						errors.push(`File not staged: ${file}`);
+-						continue;
+-					}
+-					if (seen.has(file)) {
+-						errors.push(`File listed multiple times in commit ${commit.summary}: ${file}`);
+-						continue;
+-					}
+-					if (usedFiles.has(file)) {
+-						errors.push(`File appears in multiple commits: ${file}`);
+-						continue;
+-					}
+-					seen.add(file);
+-					usedFiles.add(file);
+-				}
+-			}
++			return validateSplitCommitPlan(cwd, params, state, changelogTargets);
++		},
++	};
++}
+ 
+-			for (const file of stagedFiles) {
+-				if (!usedFiles.has(file)) {
+-					errors.push(`Staged file missing from split plan: ${file}`);
+-				}
++/** Validate a reviewed split plan using the same rules as the commit agent. */
++export async function validateSplitCommitPlan(
++	cwd: string,
++	input: unknown,
++	state: CommitAgentState = {},
++	changelogTargets: string[] = [],
++): Promise<AgentToolResult<SplitCommitResponse>> {
++	const params = splitCommitSchema.assert(input);
++	const repo = vcs.requireGit(cwd);
++	const stagedFiles = state.overview?.files ?? (await repo.changedFiles({ cached: true }));
++	const stagedSet = new Set(stagedFiles);
++	const changelogSet = new Set(changelogTargets);
++	const usedFiles = new Set<string>();
++	const errors: string[] = [];
++	const warnings: string[] = [];
++	const diffText = await repo.diffText({ cached: true });
++
++	const commits: SplitCommitGroup[] = params.commits.map((commit, index) => {
++		const scope = commit.scope?.trim() || null;
++		const summary = normalizeSummary(commit.summary, commit.type, scope);
++		const detailInput = normalizeDetails(commit.details ?? []);
++		const detailResult = capDetails(detailInput);
++		warnings.push(...detailResult.warnings.map(warning => `Commit ${index + 1}: ${warning}`));
++		const issueRefs = commit.issue_refs ?? [];
++		const dependencies = (commit.dependencies ?? []).map(dep => Math.floor(dep));
++		const changes = commit.changes.map(change => ({
++			path: change.path,
++			kind: change.kind,
++			indices: change.kind === "indices" ? change.indices : undefined,
++			start: change.kind === "lines" ? change.start : undefined,
++			end: change.kind === "lines" ? change.end : undefined,
++		}));
++		const files = changes.map(change => change.path);
++
++		const summaryValidation = validateSummaryRules(summary);
++		const scopeValidation = validateScope(scope);
++		const typeValidation = validateTypeConsistency(commit.type, files, {
++			diffText,
++			summary,
++			details: detailResult.details,
++		});
++
++		if (summaryValidation.errors.length > 0) {
++			errors.push(...summaryValidation.errors.map(error => `Commit ${index + 1}: ${error}`));
++		}
++		if (!scopeValidation.valid) {
++			errors.push(...scopeValidation.errors.map(error => `Commit ${index + 1}: ${error}`));
++		}
++		if (typeValidation.errors.length > 0) {
++			errors.push(...typeValidation.errors.map(error => `Commit ${index + 1}: ${error}`));
++		}
++		warnings.push(...summaryValidation.warnings.map(warning => `Commit ${index + 1}: ${warning}`));
++		warnings.push(...typeValidation.warnings.map(warning => `Commit ${index + 1}: ${warning}`));
++		const hunkValidation = validateHunkSelectors(index, changes, files, diffText);
++		warnings.push(...hunkValidation.warnings);
++		errors.push(...hunkValidation.errors);
++		errors.push(...validateDependencies(index, dependencies, params.commits.length));
++
++		return {
++			changes,
++			type: commit.type,
++			scope,
++			summary,
++			details: detailResult.details,
++			issueRefs,
++			rationale: commit.rationale?.trim() || undefined,
++			dependencies,
++		};
++	});
++
++	for (const commit of commits) {
++		const seen = new Set<string>();
++		for (const change of commit.changes) {
++			const file = change.path;
++			if (!stagedSet.has(file) && !changelogSet.has(file)) {
++				errors.push(`File not staged: ${file}`);
++				continue;
+ 			}
+-
+-			const dependencyCheck = computeDependencyOrder(commits);
+-			if ("error" in dependencyCheck) {
+-				errors.push(dependencyCheck.error);
++			if (seen.has(file)) {
++				errors.push(`File listed multiple times in commit ${commit.summary}: ${file}`);
++				continue;
+ 			}
++			if (usedFiles.has(file)) {
++				errors.push(`File appears in multiple commits: ${file}`);
++				continue;
++			}
++			seen.add(file);
++			usedFiles.add(file);
++		}
++	}
+ 
+-			const response: SplitCommitResponse = {
+-				valid: errors.length === 0,
+-				errors,
+-				warnings,
+-			};
++	for (const file of stagedFiles) {
++		if (!usedFiles.has(file)) {
++			errors.push(`Staged file missing from split plan: ${file}`);
++		}
++	}
+ 
+-			if (response.valid) {
+-				response.proposal = { commits, warnings };
+-				state.splitProposal = response.proposal;
+-			}
++	const dependencyCheck = computeDependencyOrder(commits);
++	if ("error" in dependencyCheck) {
++		errors.push(dependencyCheck.error);
++	}
++
++	const response: SplitCommitResponse = {
++		valid: errors.length === 0,
++		errors,
++		warnings,
++	};
+ 
+-			const text = JSON.stringify(
+-				{
+-					...response,
+-					constraints: {
+-						maxSummaryChars: SUMMARY_MAX_CHARS,
+-						maxDetailItems: MAX_DETAIL_ITEMS,
+-					},
+-				},
+-				null,
+-				2,
+-			);
+-
+-			return {
+-				content: [{ type: "text", text }],
+-				details: response,
+-			};
++	if (response.valid) {
++		response.proposal = { commits, warnings };
++		state.splitProposal = response.proposal;
++	}
++
++	const text = JSON.stringify(
++		{
++			...response,
++			constraints: {
++				maxSummaryChars: SUMMARY_MAX_CHARS,
++				maxDetailItems: MAX_DETAIL_ITEMS,
++			},
+ 		},
++		null,
++		2,
++	);
++
++	return {
++		content: [{ type: "text", text }],
++		details: response,
+ 	};
+ }
+ 
+diff --git a/packages/coding-agent/src/modes/acp/acp-agent.ts b/packages/coding-agent/src/modes/acp/acp-agent.ts
+index 45d55d0..1e3e905 100644
+--- a/packages/coding-agent/src/modes/acp/acp-agent.ts
++++ b/packages/coding-agent/src/modes/acp/acp-agent.ts
+@@ -1,5 +1,12 @@
+ import * as fs from "node:fs/promises";
+ import * as path from "node:path";
++import {
++	LODY_EXTENSION_METHODS,
++	type LodySteerRequest,
++	type LodySteerResponse,
++	type LodySteeringCapability,
++} from "acp-extension-core";
++import { z } from "zod";
+ import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
+ import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+ import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
+@@ -34,7 +41,6 @@ import {
+ 	type ResumeSessionRequest,
+ 	type ResumeSessionResponse,
+ 	type SessionConfigOption,
+-	type SessionInfo,
+ 	type SessionModeState,
+ 	type SessionNotification,
+ 	type SessionUpdate,
+@@ -44,8 +50,6 @@ import {
+ 	type SetSessionModeResponse,
+ 	type Usage,
+ } from "@oh-my-pi/pi-utils/acp";
+-import { disableProvider, enableProvider } from "../../capability";
+-import { Settings } from "../../config/settings";
+ import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
+ import {
+ 	type ExtensionUIContext,
+@@ -56,9 +60,17 @@ import { runExtensionCompact } from "../../extensibility/extensions/compact-hand
+ import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+ import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
+ import { MCPManager } from "../../mcp/manager";
++import { buildMCPPromptCommands } from "../../mcp/prompt-commands";
+ import type { MCPServerConfig } from "../../mcp/types";
+-import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
+-import { theme } from "@oh-my-pi/pi-tui/theme";
++import {
++	theme,
++	ensureThemeSync,
++	getAvailableThemesWithPaths,
++	getThemeByName,
++	setTheme,
++	setThemeInstance,
++	Theme,
++} from "@oh-my-pi/pi-tui/theme";
+ import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
+ import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
+ import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+@@ -67,15 +79,14 @@ import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "
+ import type { UsageStatistics } from "../../session/session-entries";
+ import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
+ import { SessionManager } from "../../session/session-manager";
++import { toSessionInfo, runOmpManagementMethod } from "../../slash-commands/native-management";
+ import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
+ import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
+-import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
+ import { refreshAgentDiscovery } from "../../task";
+ import { AUTO_THINKING, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+ import { OTHER_OPTION } from "../../tools/ask";
+ import { resolvePlanFilePath } from "../../plan-mode/plan-files";
+ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+-import { DEFAULT_TTS_VOICE, TTS_LOCAL_MODELS, TTS_LOCAL_VOICE_OPTIONS } from "../../tts/models";
+ import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
+ import { createAcpClientBridge } from "./acp-client-bridge";
+ import {
+@@ -84,8 +95,9 @@ import {
+ 	normalizeReplayToolArguments,
+ } from "./acp-event-mapper";
+ import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
++import { createAcpComponentPresenter } from "./acp-components";
++import { AcpCollaboration } from "./acp-collaboration";
+ 
+-import { cfgDisabledExtensions } from "../../extensibility/settings";
+ import { cfgPlanEnabled } from "../../plan-mode/settings";
+ 
+ const ACP_DEFAULT_MODE_ID = "default";
+@@ -98,7 +110,6 @@ const MODEL_CONFIG_ID = "model";
+ const THINKING_CONFIG_ID = "thinking";
+ const THINKING_OFF = "off";
+ const SESSION_PAGE_SIZE = 50;
+-const SPEECH_MODELS_LIST_METHOD = "speech.models.list";
+ /**
+  * Delay between `session/new` (or `session/load` / `session/resume` /
+  * `unstable_session/fork`) returning and the agent firing the first
+@@ -111,6 +122,31 @@ export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
+ const ACP_CANCEL_CLEANUP_TIMEOUT_MS = 5_000;
+ const ACP_ASYNC_DELIVERY_DRAIN_TIMEOUT_MS = 250;
+ const ACP_ASYNC_DELIVERY_DRAIN_MAX_PASSES = 3;
++const STEER_CUSTOM_TYPE = "lody-steer";
++const steeringCapability: LodySteeringCapability = {
++	version: 1,
++	transport: "request",
++	upstreamTurn: "same",
++	configPolicy: "active",
++};
++const steerRequestSchema = z.object({
++	sessionId: z.string().min(1),
++	steerId: z.string().min(1),
++	prompt: z
++		.array(
++			z.union([
++				z.object({ type: z.literal("text"), text: z.string() }),
++				z.object({ type: z.literal("image"), data: z.string(), mimeType: z.string() }),
++			]),
++		)
++		.min(1),
++});
++type PendingSteer = {
++	applied: boolean;
++	withdraw?: () => boolean;
++	resolve: (response: LodySteerResponse) => void;
++	reject: (error: unknown) => void;
++};
+ 
+ type AgentImageContent = {
+ 	type: "image";
+@@ -181,6 +217,9 @@ type ManagedSessionRecord = {
+ 	closedError: PromptLifecycleError | undefined;
+ 	promptEventHandlers: Set<Promise<void>>;
+ 	extensionUserMessageTasks: Set<Promise<void>>;
++	pendingSteers: Map<string, PendingSteer>;
++	steerDelivery: Promise<void> | undefined;
++	collaboration: AcpCollaboration | undefined;
+ };
+ 
+ type ReplayableMessage = {
+@@ -233,64 +272,6 @@ function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
+ 	return "session" in created ? created : { session: created, setToolUIContext: undefined };
+ }
+ 
+-type AcpSpeechOption = {
+-	value: string;
+-	label: string;
+-	description?: string;
+-};
+-
+-type AcpSpeechVoiceOption = {
+-	value: string;
+-	label: string;
+-};
+-
+-type AcpSpeechTtsModelOption = AcpSpeechOption & {
+-	voices: AcpSpeechVoiceOption[];
+-};
+-
+-function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
+-	const localSelector = (modelId: string) => `local/${modelId}`;
+-	const defaultSpeechModel = localSelector(TTS_LOCAL_MODELS[0].key);
+-	const defaultDictationModel = localSelector(DEFAULT_STT_MODEL_KEY);
+-	const voices = TTS_LOCAL_VOICE_OPTIONS.map(({ value, label }) => ({ value, label }));
+-	return {
+-		settings: {
+-			speechToTextModel: "modelRoles.dictation",
+-			textToSpeechModel: "modelRoles.speech",
+-			textToSpeechVoice: "tts.localVoice",
+-			speechVoice: "speech.voice",
+-		},
+-		defaults: {
+-			speechToTextModel: defaultDictationModel,
+-			textToSpeechModel: defaultSpeechModel,
+-			voice: DEFAULT_TTS_VOICE,
+-		},
+-		speechToText: {
+-			setting: "modelRoles.dictation",
+-			defaultValue: defaultDictationModel,
+-			models: STT_MODELS.map(({ key, label, description }) => ({
+-				value: localSelector(key),
+-				label,
+-				description,
+-			})),
+-		},
+-		textToSpeech: {
+-			modelSetting: "modelRoles.speech",
+-			voiceSetting: "tts.localVoice",
+-			speechVoiceSetting: "speech.voice",
+-			defaultModel: defaultSpeechModel,
+-			defaultVoice: DEFAULT_TTS_VOICE,
+-			models: TTS_LOCAL_MODELS.map(({ key, label, description, voices: modelVoices }): AcpSpeechTtsModelOption => ({
+-				value: localSelector(key),
+-				label,
+-				description,
+-				voices: modelVoices.map(({ id, label: voiceLabel }) => ({ value: id, label: voiceLabel })),
+-			})),
+-			voices,
+-		},
+-	};
+-}
+-
+ /**
+  * Bridge an ExtensionUIContext form to ACP `unstable_createElicitation`.
+  *
+@@ -425,8 +406,23 @@ export function createAcpExtensionUiContext(
+ 	connection: AgentSideConnection,
+ 	getSessionId: () => string,
+ 	clientCapabilities: ClientCapabilities | undefined,
++	getTurnSignal: () => AbortSignal | undefined = () => undefined,
+ ): ExtensionUIContext {
+ 	const supportsForm = clientCapabilities?.elicitation?.form != null;
++	const metadata = clientCapabilities?._meta?.lody;
++	const supportsComponents =
++		metadata &&
++		typeof metadata === "object" &&
++		"elicitation" in metadata &&
++		metadata.elicitation &&
++		typeof metadata.elicitation === "object" &&
++		"version" in metadata.elicitation &&
++		metadata.elicitation.version === 1 &&
++		"components" in metadata.elicitation &&
++		metadata.elicitation.components &&
++		typeof metadata.elicitation.components === "object" &&
++		"version" in metadata.elicitation.components &&
++		metadata.elicitation.components.version === 1;
+ 	return {
+ 		select: async (title, options, dialogOptions) => {
+ 			if (!supportsForm) return undefined;
+@@ -581,7 +577,10 @@ export function createAcpExtensionUiContext(
+ 		setFooter: () => {},
+ 		setHeader: () => {},
+ 		setTitle: () => {},
+-		custom: async () => undefined as never,
++		custom:
++			supportsForm && supportsComponents
++				? createAcpComponentPresenter(connection, getSessionId, getTurnSignal)
++				: async () => undefined as never,
+ 		pasteToEditor: () => {},
+ 		setEditorText: () => {},
+ 		getEditorText: () => "",
+@@ -600,11 +599,19 @@ export function createAcpExtensionUiContext(
+ 		addAutocompleteProvider: () => {},
+ 		setEditorComponent: () => {},
+ 		get theme() {
++			ensureThemeSync();
+ 			return theme;
+ 		},
+-		getAllThemes: async () => [],
+-		getTheme: async () => undefined,
+-		setTheme: async () => ({ success: false, error: "Theme changes are unavailable in ACP mode" }),
++		getAllThemes: getAvailableThemesWithPaths,
++		getTheme: getThemeByName,
++		setTheme: async value => {
++			if (typeof value === "string") return setTheme(value);
++			if (value instanceof Theme) {
++				setThemeInstance(value);
++				return { success: true };
++			}
++			return { success: false, error: "Invalid theme" };
++		},
+ 		getToolsExpanded: () => false,
+ 		setToolsExpanded: () => {},
+ 	};
+@@ -659,6 +666,7 @@ export class AcpAgent implements Agent {
+ 			},
+ 			authMethods,
+ 			agentCapabilities: {
++				_meta: { lody: { steering: steeringCapability } },
+ 				loadSession: true,
+ 				mcpCapabilities: {
+ 					http: true,
+@@ -726,7 +734,7 @@ export class AcpAgent implements Agent {
+ 		const paged = sessions.slice(offset, offset + SESSION_PAGE_SIZE);
+ 		const nextOffset = offset + paged.length;
+ 		return {
+-			sessions: paged.map(session => this.#toSessionInfo(session)),
++			sessions: paged.map(session => toSessionInfo(session)),
+ 			nextCursor: nextOffset < sessions.length ? String(nextOffset) : undefined,
+ 		};
+ 	}
+@@ -966,6 +974,13 @@ export class AcpAgent implements Agent {
+ 
+ 	async #runPromptOrCommand(record: ManagedSessionRecord, text: string, images: AgentImageContent[]): Promise<void> {
+ 		const promptTurn = record.promptTurn;
++		if (record.collaboration?.joined && !/^\/(?:leave|collab\s+status)(?:\s|$)/.test(text)) {
++			if (text.startsWith("/")) throw new Error("Only /leave and /collab status are available in a joined session");
++			await record.collaboration.prompt(text, images, promptTurn?.abortController.signal);
++			await this.#waitForPromptEventHandlers(record);
++			this.#finishPrompt(record, { stopReason: "end_turn" });
++			return;
++		}
+ 		const skillResult = await this.#tryRunSkillCommand(record, text);
+ 		if (skillResult || promptTurn?.cancelRequested) {
+ 			return;
+@@ -977,7 +992,21 @@ export class AcpAgent implements Agent {
+ 			settings: record.session.settings,
+ 			cwd: record.session.sessionManager.getCwd(),
+ 			signal: promptTurn?.abortController.signal,
++			collaboration: (name, args) => {
++				record.collaboration ??= new AcpCollaboration(record.session, event =>
++					this.#trackPromptEvent(record, event),
++				);
++				return record.collaboration.command(name, args, promptTurn?.abortController.signal, () =>
++					this.#emitCommandOutput(record, "Waiting for a guest prompt. Cancel to stop waiting."),
++				);
++			},
+ 			output: output => this.#emitCommandOutput(record, output),
++			confirm: (title, message) =>
++				createAcpExtensionUiContext(
++					this.#connection,
++					() => record.session.sessionId,
++					this.#clientCapabilities,
++				).confirm(title, message, { signal: promptTurn?.abortController.signal }),
+ 			refreshCommands: () => this.#emitAvailableCommandsUpdate(record),
+ 			reloadPlugins: () => this.#reloadPluginState(record),
+ 			keepTurnOpenUntilIdle: async () => {
+@@ -1129,82 +1158,41 @@ export class AcpAgent implements Agent {
+ 	}
+ 
+ 	async extMethod(method: string, params: { [key: string]: unknown }): Promise<{ [key: string]: unknown }> {
+-		switch (method) {
+-			case SPEECH_MODELS_LIST_METHOD:
+-				return buildAcpSpeechModelsCatalog();
+-			case "_omp/sessions/listAll": {
+-				const limit = typeof params.limit === "number" ? Math.max(1, Math.min(5000, params.limit as number)) : 1000;
+-				const sessions = await SessionManager.listAll();
+-				const sorted = sessions.sort((l, r) => r.modified.getTime() - l.modified.getTime()).slice(0, limit);
+-				return {
+-					sessions: sorted.map(s => this.#toSessionInfo(s)),
+-					total: sessions.length,
+-				};
+-			}
+-			case "_omp/projects/list": {
+-				const sessions = await SessionManager.listAll();
+-				const buckets = new Map<
+-					string,
+-					{ cwd: string; sessionCount: number; lastActivityAt: number; lastTitle: string }
+-				>();
+-				for (const s of sessions) {
+-					if (!s.cwd) continue;
+-					const ts = s.modified.getTime();
+-					const existing = buckets.get(s.cwd);
+-					if (existing) {
+-						existing.sessionCount += 1;
+-						if (ts > existing.lastActivityAt) {
+-							existing.lastActivityAt = ts;
+-							existing.lastTitle = s.title ?? "";
+-						}
+-					} else {
+-						buckets.set(s.cwd, {
+-							cwd: s.cwd,
+-							sessionCount: 1,
+-							lastActivityAt: ts,
+-							lastTitle: s.title ?? "",
+-						});
+-					}
+-				}
+-				const projects = Array.from(buckets.values()).sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+-				return { projects, totalSessions: sessions.length };
+-			}
+-			case "_omp/chats/byCwd": {
+-				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
+-				if (!cwd) throw new Error("cwd required");
+-				const limit = typeof params.limit === "number" ? Math.max(1, Math.min(500, params.limit as number)) : 100;
+-				const sessions = await SessionManager.list(cwd);
+-				const sorted = sessions.sort((l, r) => r.modified.getTime() - l.modified.getTime()).slice(0, limit);
+-				return { sessions: sorted.map(s => this.#toSessionInfo(s)) };
+-			}
+-			case "_omp/usage": {
+-				const [firstRecord] = this.#sessions.values();
+-				const target = firstRecord?.session ?? this.#initialSession;
+-				if (!target) {
+-					return { reports: [] };
+-				}
+-				const reports = await target.fetchUsageReports();
+-				return { reports: reports ?? [] };
+-			}
+-			case "_omp/extensions": {
+-				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
+-				const sm = await Settings.init();
+-				const disabledIds = cfgDisabledExtensions.get(sm);
+-				const extensions = await loadAllExtensions(cwd, disabledIds);
+-				return { extensions: extensions as unknown as Array<{ [key: string]: unknown }> };
+-			}
+-			case "_omp/extensions/toggle": {
+-				const providerId = params.providerId;
+-				if (typeof providerId !== "string") throw new Error("providerId required");
+-				if (params.enabled === false) {
+-					disableProvider(providerId);
+-					return { enabled: false };
+-				}
+-				enableProvider(providerId);
+-				return { enabled: true };
+-			}
+-			default:
+-				throw new Error(`Unknown ACP ext method: ${method}`);
++		if (method === LODY_EXTENSION_METHODS.sessionSteer) return this.#steer(params);
++		const [firstRecord] = this.#sessions.values();
++		return runOmpManagementMethod(method, params, firstRecord?.session ?? this.#initialSession);
++	}
++
++	async #steer(params: Record<string, unknown>): Promise<LodySteerResponse> {
++		const request: LodySteerRequest<PromptRequest["prompt"][number]> = steerRequestSchema.parse(params);
++		const record = this.#getSessionRecord(request.sessionId);
++		const turn = record.promptTurn;
++		const isActive = () =>
++			record.promptTurn === turn && !!turn && !turn.settled && !turn.cancelRequested && !record.closedError;
++		if (!isActive()) return { outcome: "failed" };
++		if (record.pendingSteers.has(request.steerId)) throw new Error("Duplicate steer id");
++		const receipt = Promise.withResolvers<LodySteerResponse>();
++		// A cancellation may settle the receipt while normalization/output is still awaited below.
++		void receipt.promise.catch(() => {});
++		const pending: PendingSteer = { applied: false, resolve: receipt.resolve, reject: receipt.reject };
++		record.pendingSteers.set(request.steerId, pending);
++		try {
++			const converted = this.#convertPromptBlocks(request.prompt);
++			pending.withdraw = await record.session.trySteerCustomMessage(
++				{
++					customType: STEER_CUSTOM_TYPE,
++					content: [{ type: "text", text: converted.text }, ...converted.images],
++					display: true,
++					details: { steerId: request.steerId },
++					attribution: "user",
++				},
++				isActive,
++			);
++			if (!pending.withdraw) pending.resolve({ outcome: "failed" });
++			else await this.#emitCommandOutput(record, "Steering input queued.\n");
++			return await receipt.promise;
++		} finally {
++			record.pendingSteers.delete(request.steerId);
+ 		}
+ 	}
+ 
+@@ -1361,6 +1349,9 @@ export class AcpAgent implements Agent {
+ 			closedError: undefined,
+ 			promptEventHandlers: new Set(),
+ 			extensionUserMessageTasks: new Set(),
++			pendingSteers: new Map(),
++			steerDelivery: undefined,
++			collaboration: undefined,
+ 			lifetimeUnsubscribe: undefined,
+ 		};
+ 	}
+@@ -1422,6 +1413,32 @@ export class AcpAgent implements Agent {
+ 		if (!promptTurn || promptTurn.settled || promptTurn.cancelRequested) {
+ 			return;
+ 		}
++		const previousSteerDelivery = record.steerDelivery;
++		if (
++			event.type === "message_start" &&
++			event.message.role === "custom" &&
++			event.message.customType === STEER_CUSTOM_TYPE
++		) {
++			const details = event.message.details;
++			const id = details && typeof details === "object" && "steerId" in details ? details.steerId : undefined;
++			const pending = typeof id === "string" ? record.pendingSteers.get(id) : undefined;
++			if (pending && !pending.applied) {
++				pending.applied = true;
++				const delivery = (async () => {
++					await previousSteerDelivery;
++					await this.#connection.extNotification(LODY_EXTENSION_METHODS.sessionSteerApplied, {
++						sessionId: record.session.sessionId,
++						steerId: id,
++					});
++					pending.resolve({ outcome: "injected" });
++				})();
++				record.steerDelivery = delivery.catch(() => {});
++				delivery.catch(pending.reject);
++				await delivery;
++			}
++		} else {
++			await previousSteerDelivery;
++		}
+ 
+ 		if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
+ 			record.toolArgsById.set(event.toolCallId, event.args);
+@@ -1469,6 +1486,12 @@ export class AcpAgent implements Agent {
+ 		if (event.type === "agent_end") {
+ 			await this.#flushMissedFinalAssistantText(record, event);
+ 			await this.#flushUnreportedTurnError(record, event);
++			if (record.collaboration?.joined) {
++				record.liveMessageId = undefined;
++				record.liveMessageProgress = undefined;
++				this.#finishPrompt(record, { stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested) });
++				return;
++			}
+ 			await this.#emitEndOfTurnUpdates(record);
+ 			await this.#waitForAcpPromptIdle(record);
+ 			record.liveMessageId = undefined;
+@@ -1628,6 +1651,17 @@ export class AcpAgent implements Agent {
+ 			return;
+ 		}
+ 		promptTurn.settled = true;
++		for (const pending of record.pendingSteers.values()) {
++			if (pending.applied) continue;
++			const withdrawn = pending.withdraw?.();
++			if (!pending.withdraw || withdrawn) pending.resolve({ outcome: "failed" });
++			else pending.reject(new Error("Turn ended before steer application could be confirmed"));
++			// Abort recovery may restore an in-flight queue batch after this synchronous withdrawal.
++			void record.session
++				.waitForIdle()
++				.then(() => pending.withdraw?.())
++				.catch(() => {});
++		}
+ 		promptTurn.unsubscribe?.();
+ 		// Keep the slot occupied until cancel cleanup finishes — `#runCancelCleanup`
+ 		// evicts the slot in its finally block once both flags say it's safe.
+@@ -2061,19 +2095,6 @@ export class AcpAgent implements Agent {
+ 		return toAcpAvailableCommands(await buildAvailableSlashCommands(session));
+ 	}
+ 
+-	#toSessionInfo(session: StoredSessionInfo): SessionInfo {
+-		return {
+-			sessionId: session.id,
+-			cwd: session.cwd,
+-			title: session.title,
+-			updatedAt: session.modified.toISOString(),
+-			_meta: {
+-				messageCount: session.messageCount,
+-				size: session.size,
+-			},
+-		};
+-	}
+-
+ 	#scheduleBootstrapUpdates(sessionId: string): void {
+ 		// Defer first notifications until the response has reached the client.
+ 		// Zed's agent-client-protocol reader dispatches responses and
+@@ -2543,6 +2564,7 @@ export class AcpAgent implements Agent {
+ 			this.#connection,
+ 			() => record.session.sessionId,
+ 			this.#clientCapabilities,
++			() => record.promptTurn?.abortController.signal,
+ 		);
+ 		if (this.#clientCapabilities?.elicitation?.form != null) {
+ 			record.setToolUIContext?.(uiContext, true);
+@@ -2650,14 +2672,17 @@ export class AcpAgent implements Agent {
+ 	}
+ 
+ 	async #configureMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
+-		if (record.mcpManager) {
+-			await record.mcpManager.disconnectAll();
++		const previousManager = record.mcpManager;
++		record.mcpManager = undefined;
++		if (previousManager) {
++			await previousManager.disconnectAll();
+ 		}
+ 		// Drain any in-flight refresh queued by a previous configuration: a refresh
+ 		// that already passed its manager guard could otherwise finish applying a
+ 		// stale tool set after this reconfiguration installs the new one.
+ 		await record.mcpRefreshChain;
+ 		record.mcpRefreshChain = undefined;
++		record.session.setMCPPromptCommands([]);
+ 		if (servers.length === 0) {
+ 			record.mcpManager = undefined;
+ 			await record.session.refreshMCPTools([]);
+@@ -2689,6 +2714,10 @@ export class AcpAgent implements Agent {
+ 			// Failures are logged once via the stored chain's catch above.
+ 			enqueueMcpToolsRefresh().catch(() => {});
+ 		});
++		manager.setOnPromptsChanged(() => {
++			if (record.mcpManager !== manager) return;
++			record.session.setMCPPromptCommands(buildMCPPromptCommands(manager));
++		});
+ 		const configs: MCPConfigMap = {};
+ 		const sources: MCPSourceMap = {};
+ 		for (const server of servers) {
+@@ -2711,6 +2740,7 @@ export class AcpAgent implements Agent {
+ 		}
+ 
+ 		record.mcpManager = manager;
++		record.session.setMCPPromptCommands(buildMCPPromptCommands(manager));
+ 		await enqueueMcpToolsRefresh();
+ 	}
+ 
+@@ -2771,6 +2801,8 @@ export class AcpAgent implements Agent {
+ 	}
+ 
+ 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
++		await record.collaboration?.dispose();
++		record.collaboration = undefined;
+ 		record.lifetimeUnsubscribe?.();
+ 		if (record.mcpManager) {
+ 			try {
+diff --git a/packages/coding-agent/src/sdk.ts b/packages/coding-agent/src/sdk.ts
+index d5f0649..8943755 100644
+--- a/packages/coding-agent/src/sdk.ts
++++ b/packages/coding-agent/src/sdk.ts
+@@ -94,7 +94,6 @@ import { defaultEvalSessionId } from "./eval/session-id";
+ import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
+ import {
+ 	type CustomCommandsLoadResult,
+-	type LoadedCustomCommand,
+ 	loadCustomCommands as loadCustomCommandsInternal,
+ } from "./extensibility/custom-commands";
+ import { discoverCustomToolPaths, loadCustomTools, type ToolPathWithSource } from "./extensibility/custom-tools";
+@@ -146,6 +145,7 @@ import {
+ import { parseMCPToolName } from "@oh-my-pi/pi-tui/tools/mcp";
+ import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
+ import { resolveMCPToolAlias } from "./mcp/tool-bridge";
++import { buildMCPPromptCommands } from "./mcp/prompt-commands";
+ import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
+ import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
+ import type { MnemopiSessionState } from "./mnemopi/state";
+@@ -1443,55 +1443,6 @@ function createCustomToolsExtension(tools: CustomTool[], sourcePaths?: ReadonlyM
+ 
+ // Factory
+ 
+-/**
+- * Build LoadedCustomCommand entries for all MCP prompts across connected servers.
+- * These are re-created whenever prompts change (setOnPromptsChanged callback).
+- */
+-function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
+-	const commands: LoadedCustomCommand[] = [];
+-	for (const serverName of manager.getConnectedServers()) {
+-		const prompts = manager.getServerPrompts(serverName);
+-		if (!prompts?.length) continue;
+-		for (const prompt of prompts) {
+-			const commandName = `${serverName}:${prompt.name}`;
+-			commands.push({
+-				path: `mcp:${commandName}`,
+-				resolvedPath: `mcp:${commandName}`,
+-				source: "bundled",
+-				command: {
+-					name: commandName,
+-					description: prompt.description ?? `MCP prompt from ${serverName}`,
+-					async execute(args: string[]) {
+-						const promptArgs: Record<string, string> = {};
+-						for (const arg of args) {
+-							const eqIdx = arg.indexOf("=");
+-							if (eqIdx > 0) {
+-								promptArgs[arg.slice(0, eqIdx)] = arg.slice(eqIdx + 1);
+-							}
+-						}
+-						const result = await manager.executePrompt(serverName, prompt.name, promptArgs);
+-						if (!result) return "";
+-						const parts: string[] = [];
+-						for (const msg of result.messages) {
+-							const contentItems = Array.isArray(msg.content) ? msg.content : [msg.content];
+-							for (const item of contentItems) {
+-								if (item.type === "text") {
+-									parts.push(item.text);
+-								} else if (item.type === "resource") {
+-									const resource = item.resource;
+-									if (resource.text) parts.push(resource.text);
+-								}
+-							}
+-						}
+-						return parts.join("\n\n");
+-					},
+-				},
+-			});
+-		}
+-	}
+-	return commands;
+-}
+-
+ /** Dependencies used to construct an isolated auto-learn capture agent. */
+ export interface AutoLearnCaptureRunnerOptions {
+ 	sourceAgent: Agent;
+diff --git a/packages/coding-agent/src/session/agent-session.ts b/packages/coding-agent/src/session/agent-session.ts
+index a29e5d4..dc5da1c 100644
+--- a/packages/coding-agent/src/session/agent-session.ts
++++ b/packages/coding-agent/src/session/agent-session.ts
+@@ -8098,6 +8098,23 @@ export class AgentSession implements SettingsScope {
+ 		}
+ 	}
+ 
++	/** Queue only onto the caller's still-active turn, after asynchronous image normalization. */
++	async trySteerCustomMessage(
++		message: Pick<CustomMessage, "customType" | "content" | "display" | "details" | "attribution">,
++		isActive: () => boolean,
++	): Promise<(() => boolean) | undefined> {
++		const generation = this.#sessionGeneration;
++		const normalized = await this.#normalizeAgentMessageImages({
++			role: "custom",
++			...message,
++			attribution: message.attribution ?? "user",
++			timestamp: Date.now(),
++		});
++		if (generation !== this.#sessionGeneration || !isActive() || !this.agent.state.isStreaming) return;
++		this.agent.steer(normalized);
++		return () => this.agent.withdrawSteeringMessage(normalized);
++	}
++
+ 	/** Queue a custom message without starting a turn, matching steer/follow-up/aside delivery. */
+ 	async #queueCustomMessage<T = unknown>(
+ 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+diff --git a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
+index 46b0f42..e23c13f 100644
+--- a/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
++++ b/packages/coding-agent/src/slash-commands/builtin-collaboration.ts
+@@ -18,7 +18,7 @@ import { copyToClipboard } from "../utils/clipboard";
+ import { refreshStatusLine } from "./builtin-modes";
+ import { CollabQrCodeComponent, collabBrowserLink } from "@oh-my-pi/pi-tui/chrome/collab-qrcode";
+ import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers/parse";
+-import type { SlashCommandSpec } from "./types";
++import type { ParsedSlashCommand, SlashCommandRuntime, SlashCommandSpec } from "./types";
+ 
+ import { cfgBrowserEnabled, cfgBrowserHeadless } from "../tools/browser/settings";
+ import { cfgShareRedactSecrets, cfgShareServerUrl, cfgShareStore } from "../commands/settings";
+@@ -56,6 +56,13 @@ function showCollabLink(ctx: InteractiveModeContext, host: CollabHost, heading:
+ 	showCollabQrCode(ctx, view ? host.webViewLink : host.webLink);
+ }
+ 
++async function handleHeadlessCollaboration(command: ParsedSlashCommand, runtime: SlashCommandRuntime) {
++	if (!runtime.collaboration) return usage("Native collaboration is unavailable on this transport", runtime);
++	const result = await runtime.collaboration(command.name, command.args);
++	if (result !== undefined) await runtime.output(JSON.stringify(result));
++	return commandConsumed();
++}
++
+ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
+ 	{
+ 		name: "advisor",
+@@ -286,6 +293,8 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
+ 	},
+ 	{
+ 		name: "collab",
++		handle: handleHeadlessCollaboration,
++		acpInputHint: "start|view|status|watch|stop [relayUrl]",
+ 		icon: "broadcast",
+ 		description: "Share this session live via a relay",
+ 		inlineHint: "[start|view|list|stop|status] [relayUrl]",
+@@ -415,6 +424,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
+ 	},
+ 	{
+ 		name: "join",
++		handle: handleHeadlessCollaboration,
+ 		icon: "signIn",
+ 		description: "Join a shared collab session",
+ 		inlineHint: "<link>",
+@@ -447,6 +457,7 @@ export const BUILTIN_COLLABORATION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpe
+ 	},
+ 	{
+ 		name: "leave",
++		handle: handleHeadlessCollaboration,
+ 		icon: "signOut",
+ 		description: "Leave the collab session",
+ 		getTuiAutocompleteDescription: runtime => {
+diff --git a/packages/coding-agent/src/slash-commands/builtin-registry.ts b/packages/coding-agent/src/slash-commands/builtin-registry.ts
+index d8e42d4..0b31435 100644
+--- a/packages/coding-agent/src/slash-commands/builtin-registry.ts
++++ b/packages/coding-agent/src/slash-commands/builtin-registry.ts
+@@ -11,6 +11,8 @@ import {
+ } from "./builtin-completions";
+ import { BUILTIN_CONTROL_SLASH_COMMANDS } from "./builtin-control";
+ import { BUILTIN_LIFECYCLE_SLASH_COMMANDS } from "./builtin-lifecycle";
++import { BUILTIN_MANAGEMENT_SLASH_COMMANDS } from "./builtin-management";
++import { BUILTIN_COMMIT_SLASH_COMMANDS } from "./builtin-commits";
+ import { BUILTIN_MARKETPLACE_SLASH_COMMANDS, reloadTuiPluginState } from "./builtin-marketplace";
+ import { BUILTIN_MODE_SLASH_COMMANDS } from "./builtin-modes";
+ import { BUILTIN_SESSION_SLASH_COMMANDS } from "./builtin-session";
+@@ -41,6 +43,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
+ 	...BUILTIN_COLLABORATION_SLASH_COMMANDS,
+ 	...BUILTIN_SESSION_SLASH_COMMANDS,
+ 	...BUILTIN_LIFECYCLE_SLASH_COMMANDS,
++	...BUILTIN_MANAGEMENT_SLASH_COMMANDS,
++	...BUILTIN_COMMIT_SLASH_COMMANDS,
+ 	...BUILTIN_MARKETPLACE_SLASH_COMMANDS,
+ 	...BUILTIN_SKILLS_SLASH_COMMANDS,
+ 	...BUILTIN_CONTROL_SLASH_COMMANDS,
+diff --git a/packages/coding-agent/src/slash-commands/types.ts b/packages/coding-agent/src/slash-commands/types.ts
+index ed6e1dc..c88b116 100644
+--- a/packages/coding-agent/src/slash-commands/types.ts
++++ b/packages/coding-agent/src/slash-commands/types.ts
+@@ -66,6 +66,10 @@ export interface SlashCommandRuntime {
+ 	signal?: AbortSignal;
+ 	/** Emit text to the operator. TUI maps to `ctx.showStatus`, ACP to `sessionUpdate`. */
+ 	output: (text: string) => Promise<void> | void;
++	/** An explicit operator confirmation; absent transports must refuse mutations that require it. */
++	confirm?: (title: string, message: string) => Promise<boolean>;
++	/** A transport-owned native collaboration lifecycle; TUI retains its controller. */
++	collaboration?: (name: string, args: string) => Promise<unknown>;
+ 	/** Re-advertise the available command list (no-op outside ACP). */
+ 	refreshCommands: () => Promise<void> | void;
+ 	/**
+diff --git a/packages/coding-agent/test/acp-agent.test.ts b/packages/coding-agent/test/acp-agent.test.ts
+index 4d790d1..ec2fcd8 100644
+--- a/packages/coding-agent/test/acp-agent.test.ts
++++ b/packages/coding-agent/test/acp-agent.test.ts
+@@ -3,9 +3,14 @@ import * as fs from "node:fs";
+ import * as os from "node:os";
+ import * as path from "node:path";
+ import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
++import { LODY_EXTENSION_METHODS } from "acp-extension-core";
+ import type { Model } from "@oh-my-pi/pi-ai";
+ import { buildModel } from "@oh-my-pi/pi-catalog/build";
+ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import type {
++	CustomCommandContext,
++	LoadedCustomCommand,
++} from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands";
+ import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+ import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
+ import {
+@@ -41,7 +46,11 @@ import {
+ 	zPromptResponse,
+ 	zSessionNotification,
+ } from "@oh-my-pi/pi-utils/acp";
+-import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp";
++import {
++	PROMPT_NAME as DELAYED_MCP_PROMPT_NAME,
++	PROMPT_RESULT,
++	TOOL_NAME as DELAYED_MCP_TOOL_NAME,
++} from "./fixtures/delayed-tool-mcp";
+ 
+ import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
+ 
+@@ -120,7 +129,14 @@ class FakeAgentSession {
+ 	agent: { sessionId: string; waitForIdle: () => Promise<void> };
+ 	model: Model | undefined;
+ 	thinkingLevel: string | undefined;
+-	customCommands: [] = [];
++	customCommands: LoadedCustomCommand[] = [];
++	mcpPromptCommands: LoadedCustomCommand[] = [];
++	#commandMetadataListeners = new Set<() => void>();
++	setMCPPromptCommands(commands: LoadedCustomCommand[]): void {
++		this.customCommands = [...this.customCommands.filter(command => !command.path?.startsWith("mcp:")), ...commands];
++		this.mcpPromptCommands = commands;
++		for (const listener of this.#commandMetadataListeners) listener();
++	}
+ 	extensionRunner = undefined;
+ 	isStreaming = false;
+ 	queuedMessageCount = 0;
+@@ -134,11 +150,15 @@ class FakeAgentSession {
+ 	promptCalls: string[] = [];
+ 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
+ 	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
++	trySteerCustomMessage: AgentSession["trySteerCustomMessage"] = async () => undefined;
+ 	skillsSettings = { enableSkillCommands: true };
+ 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
+ 	async refreshSkillsAndCommands(): Promise<void> {}
+-	subscribeCommandMetadataChanged(_listener: () => void): () => void {
+-		return () => {};
++	subscribeCommandMetadataChanged(listener: () => void): () => void {
++		this.#commandMetadataListeners.add(listener);
++		return () => {
++			this.#commandMetadataListeners.delete(listener);
++		};
+ 	}
+ 	planModeState: PlanModeState | undefined;
+ 	waitForIdleCalls = 0;
+@@ -436,6 +456,7 @@ type SetToolUIContextSpy = (uiContext: ExtensionUIContext, hasUI: boolean) => vo
+ interface AgentHarness {
+ 	agent: AcpAgent;
+ 	updates: SessionNotification[];
++	extensionNotifications: Array<{ method: string; params: Record<string, unknown> }>;
+ 	abortController: AbortController;
+ 	sessions: FakeAgentSession[];
+ 	setToolUIContextSpies: SetToolUIContextSpy[];
+@@ -481,6 +502,7 @@ async function createHarness(
+ 		clientCapabilities?: ClientCapabilities;
+ 		/** Runs before a notification is recorded, so a test can delay one delivery. */
+ 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
++		extensionNotificationHook?: () => Promise<void>;
+ 	} = {},
+ ): Promise<AgentHarness> {
+ 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
+@@ -495,11 +517,16 @@ async function createHarness(
+ 	await Settings.init({ agentDir, inMemory: true });
+ 
+ 	const updates: SessionNotification[] = [];
++	const extensionNotifications: Array<{ method: string; params: Record<string, unknown> }> = [];
+ 	const abortController = new AbortController();
+ 	const sessions: FakeAgentSession[] = [];
+ 	const setToolUIContextSpies: SetToolUIContextSpy[] = [];
+ 	const sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined> = [];
+ 	const connection = {
++		extNotification: async (method: string, params: Record<string, unknown>) => {
++			await options.extensionNotificationHook?.();
++			extensionNotifications.push({ method, params });
++		},
+ 		sessionUpdate: async (notification: SessionNotification) => {
+ 			// Only await when a hook is configured: `await undefined` would insert a
+ 			// microtask before the push and perturb ordering-sensitive tests.
+@@ -537,6 +564,7 @@ async function createHarness(
+ 	return {
+ 		agent,
+ 		updates,
++		extensionNotifications,
+ 		abortController,
+ 		sessions,
+ 		setToolUIContextSpies,
+@@ -554,6 +582,129 @@ async function advanceBootstrapGuard(): Promise<void> {
+ }
+ 
+ describe("ACP agent", () => {
++	it("acknowledges steer application before forwarding subsequent assistant output", async () => {
++		const deliveryEntered = Promise.withResolvers<void>();
++		const deliveryRelease = Promise.withResolvers<void>();
++		const harness = await createHarness({
++			extensionNotificationHook: async () => {
++				deliveryEntered.resolve();
++				await deliveryRelease.promise;
++			},
++		});
++		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
++		const session = harness.findSession(created.sessionId)!;
++		const finish = holdPromptStreaming(session);
++		const started = Promise.withResolvers<void>();
++		const heldPrompt = session.prompt.bind(session);
++		session.prompt = async text => {
++			const run = heldPrompt(text);
++			started.resolve();
++			return run;
++		};
++		const queued = Promise.withResolvers<Parameters<AgentSession["trySteerCustomMessage"]>[0]>();
++		session.trySteerCustomMessage = async (message, isActive) => {
++			expect(isActive()).toBe(true);
++			queued.resolve(message);
++			return () => false;
++		};
++		const original = harness.agent.prompt({
++			sessionId: created.sessionId,
++			prompt: [{ type: "text", text: "original" }],
++		});
++		await started.promise;
++		const steering = harness.agent.extMethod(LODY_EXTENSION_METHODS.sessionSteer, {
++			sessionId: created.sessionId,
++			steerId: "steer-one",
++			prompt: [{ type: "text", text: "new direction" }],
++		});
++		const message = await queued.promise;
++		for (const listener of session.listeners())
++			listener({
++				type: "message_start",
++				message: { role: "custom", ...message, timestamp: 0 },
++			} as AgentSessionEvent);
++		await deliveryEntered.promise;
++		const assistant = makeAssistantMessage("after steer");
++		for (const listener of session.listeners())
++			listener({
++				type: "message_update",
++				message: assistant,
++				assistantMessageEvent: { type: "text_delta", delta: "after steer" },
++			} as AgentSessionEvent);
++		expect(
++			harness.updates.some(
++				item =>
++					item.update.sessionUpdate === "agent_message_chunk" &&
++					item.update.content.type === "text" &&
++					item.update.content.text === "after steer",
++			),
++		).toBe(false);
++		deliveryRelease.resolve();
++		expect(await steering).toEqual({ outcome: "injected" });
++		expect(harness.extensionNotifications).toEqual([
++			{
++				method: LODY_EXTENSION_METHODS.sessionSteerApplied,
++				params: { sessionId: created.sessionId, steerId: "steer-one" },
++			},
++		]);
++		finish();
++		expect((await original).stopReason).toBe("end_turn");
++		expect(session.promptCalls).toEqual(["original"]);
++		expect(
++			harness.updates.some(
++				item =>
++					item.update.sessionUpdate === "agent_message_chunk" &&
++					item.update.content.type === "text" &&
++					item.update.content.text === "after steer",
++			),
++		).toBe(true);
++	});
++
++	it("refuses idle steer and withdraws an unapplied steer when its owning turn is cancelled", async () => {
++		const harness = await createHarness();
++		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
++		const request = {
++			sessionId: created.sessionId,
++			steerId: "pending",
++			prompt: [{ type: "text", text: "new direction" }],
++		};
++		expect(await harness.agent.extMethod(LODY_EXTENSION_METHODS.sessionSteer, request)).toEqual({
++			outcome: "failed",
++		});
++		const session = harness.findSession(created.sessionId)!;
++		const finish = holdPromptStreaming(session);
++		const started = Promise.withResolvers<void>();
++		const heldPrompt = session.prompt.bind(session);
++		session.prompt = async text => {
++			const run = heldPrompt(text);
++			started.resolve();
++			return run;
++		};
++		const queued = Promise.withResolvers<void>();
++		let remainsQueued = false;
++		session.trySteerCustomMessage = async () => {
++			remainsQueued = true;
++			queued.resolve();
++			return () => {
++				const wasQueued = remainsQueued;
++				remainsQueued = false;
++				return wasQueued;
++			};
++		};
++		const original = harness.agent.prompt({
++			sessionId: created.sessionId,
++			prompt: [{ type: "text", text: "original" }],
++		});
++		await started.promise;
++		const steering = harness.agent.extMethod(LODY_EXTENSION_METHODS.sessionSteer, request);
++		await queued.promise;
++		await harness.agent.cancel({ sessionId: created.sessionId });
++		expect(await steering).toEqual({ outcome: "failed" });
++		expect(remainsQueued).toBe(false);
++		expect(harness.extensionNotifications).toEqual([]);
++		expect((await original).stopReason).toBe("cancelled");
++		finish();
++	});
+ 	it("supports multiple live ACP sessions with model and lifecycle handlers", async () => {
+ 		const harness = await createHarness();
+ 		const first = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+@@ -1149,6 +1300,65 @@ describe("ACP agent", () => {
+ 		await Bun.sleep(0);
+ 	});
+ 
++	it("runs native management through advertised slash commands without invoking the model", async () => {
++		const harness = await createHarness();
++		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
++		const session = harness.findSession(created.sessionId)!;
++		await harness.agent.prompt({
++			sessionId: created.sessionId,
++			prompt: [{ type: "text", text: "/reload-plugins" }],
++		} as PromptRequest);
++		const advertised = harness.updates.findLast(
++			update => update.update.sessionUpdate === "available_commands_update",
++		);
++		expect(
++			advertised?.update.sessionUpdate === "available_commands_update" &&
++				advertised.update.availableCommands.some(command => command.name === "omp"),
++		).toBe(true);
++		for (const [command, property] of [
++			["speech-models", "textToSpeech"],
++			["sessions", "sessions"],
++			["projects", "projects"],
++			["chats", "sessions"],
++		]) {
++			const offset = harness.updates.length;
++			const response = await harness.agent.prompt({
++				sessionId: created.sessionId,
++				prompt: [{ type: "text", text: `/omp ${command}` }],
++			} as PromptRequest);
++			expect(response.stopReason).toBe("end_turn");
++			const output = harness.updates
++				.slice(offset)
++				.flatMap(update =>
++					update.update.sessionUpdate === "agent_message_chunk" && update.update.content.type === "text"
++						? [update.update.content.text]
++						: [],
++				)
++				.join("");
++			const result = JSON.parse(output);
++			if (command === "speech-models") expect(result[property].defaultModel).toBe("local/kokoro");
++			else expect(Array.isArray(result[property])).toBe(true);
++		}
++		expect(session.promptCalls).toEqual([]);
++		const offset = harness.updates.length;
++		await harness.agent.prompt({
++			sessionId: created.sessionId,
++			prompt: [{ type: "text", text: "/omp extension invalid native" }],
++		} as PromptRequest);
++		expect(
++			harness.updates
++				.slice(offset)
++				.some(
++					update =>
++						update.update.sessionUpdate === "agent_message_chunk" &&
++						update.update.content.type === "text" &&
++						update.update.content.text.includes("Usage: /omp extension"),
++				),
++		).toBe(true);
++		harness.abortController.abort();
++		await Bun.sleep(0);
++	});
++
+ 	it("replays messageIds and returns turn usage for prompts", async () => {
+ 		const harness = await createHarness();
+ 		const stored = new FakeAgentSession(harness.cwdA);
+@@ -2800,6 +3010,7 @@ describe("ACP agent", () => {
+ 		} {
+ 			const calls: CreateElicitationRequest[] = [];
+ 			const connection = {
++				signal: new AbortController().signal,
+ 				unstable_createElicitation: async (req: CreateElicitationRequest) => {
+ 					calls.push(req);
+ 					return handler(req);
+@@ -3067,6 +3278,173 @@ describe("ACP agent", () => {
+ 			}
+ 		});
+ 
++		const COMPONENT_CAPABILITIES: ClientCapabilities = {
++			...FORM_CAPABILITIES,
++			_meta: { lody: { elicitation: { version: 1, components: { version: 1 } } } },
++		};
++		it("runs native components across versioned GUI frames and returns the native result", async () => {
++			const frames: Array<{ id: string; revision: number; nodes: Array<{ type: string; text?: string }> }> = [];
++			const { connection } = createElicitConnection(async request => {
++				const document = (request._meta as { lody: { elicitation: { component: (typeof frames)[number] } } }).lody
++					.elicitation.component;
++				frames.push(document);
++				return {
++					action: "accept",
++					content: {
++						event: JSON.stringify({
++							version: 1,
++							componentId: document.id,
++							revision: document.revision,
++							input: frames.length === 1 ? "increment" : "confirm",
++						}),
++					},
++				};
++			});
++			const ctx = createAcpExtensionUiContext(connection, () => "component-session", COMPONENT_CAPABILITIES);
++			let count = 0;
++			let disposed = false;
++			const result = await ctx.custom<number>((_tui, _theme, _keys, done) => ({
++				render: () => ["Native count: " + count],
++				invalidate() {},
++				dispose() {
++					disposed = true;
++				},
++				handleInput(input) {
++					if (input === "increment") count++;
++					if (input === "confirm") done(count);
++				},
++			}));
++			expect(result).toBe(1);
++			expect(disposed).toBe(true);
++			expect(frames.map(frame => frame.revision)).toEqual([0, 1]);
++			expect(frames[0]?.id).toBe(frames[1]?.id);
++			expect(frames[1]?.nodes[0]?.text).toBe("Native count: 1");
++		});
++		it("preserves remapped Ctrl+J through CSI-u native input", async () => {
++			const harness = await createHarness();
++			await fs.promises.writeFile(
++				path.join(path.dirname(harness.cwdA), "agent", "keybindings.yml"),
++				"tui.select.down: [ctrl+j]\n",
++			);
++			const { connection } = createElicitConnection(async request => {
++				const doc = (
++					request._meta as {
++						lody: {
++							elicitation: {
++								component: { id: string; revision: number; keybindings: Array<{ key: string; input: string }> };
++							};
++						};
++					}
++				).lody.elicitation.component;
++				const down = doc.keybindings.find(binding => binding.key === "ctrl+j");
++				if (!down) throw new Error("Missing remapped key");
++				return {
++					action: "accept",
++					content: {
++						event: JSON.stringify({ version: 1, componentId: doc.id, revision: doc.revision, input: down.input }),
++					},
++				};
++			});
++			const ctx = createAcpExtensionUiContext(connection, () => "component-remap", COMPONENT_CAPABILITIES);
++			const result = await ctx.custom<boolean>((_tui, _theme, keys, done) => ({
++				render: () => ["Select"],
++				invalidate() {},
++				handleInput: data => done(keys.matches(data, "tui.select.down")),
++			}));
++			expect(result).toBe(true);
++			await harness.agent.dispose();
++		});
++		it("rejects stale component events before native input is applied", async () => {
++			const { connection } = createElicitConnection(async request => {
++				const doc = (request._meta as { lody: { elicitation: { component: { id: string; revision: number } } } })
++					.lody.elicitation.component;
++				return {
++					action: "accept",
++					content: {
++						event: JSON.stringify({
++							version: 1,
++							componentId: doc.id,
++							revision: doc.revision + 1,
++							input: "wrong",
++						}),
++					},
++				};
++			});
++			let applied = false;
++			const ctx = createAcpExtensionUiContext(connection, () => "component-stale", COMPONENT_CAPABILITIES);
++			await expect(
++				ctx.custom(() => ({
++					render: () => ["Native"],
++					invalidate() {},
++					handleInput() {
++						applied = true;
++					},
++				})),
++			).rejects.toThrow("Stale or foreign");
++			expect(applied).toBe(false);
++		});
++		it("aborts pending native UI and disposes its component without a GUI reply", async () => {
++			const presented = Promise.withResolvers<void>();
++			const controller = new AbortController();
++			const { connection } = createElicitConnection(async () => {
++				presented.resolve();
++				return await new Promise<CreateElicitationResponse>(() => {});
++			});
++			const ctx = createAcpExtensionUiContext(
++				connection,
++				() => "component-abort",
++				COMPONENT_CAPABILITIES,
++				() => controller.signal,
++			);
++			let disposed = false;
++			const result = ctx.custom(() => ({
++				render: () => ["Native"],
++				invalidate() {},
++				dispose() {
++					disposed = true;
++				},
++			}));
++			await presented.promise;
++			controller.abort(new Error("Component cancelled"));
++			await expect(result).rejects.toThrow("Component cancelled");
++			expect(disposed).toBe(true);
++		});
++		it("disposes a native factory that completes after cancellation", async () => {
++			const controller = new AbortController();
++			const factoryReady = Promise.withResolvers<void>();
++			const released = Promise.withResolvers<{ render(): string[]; invalidate(): void; dispose(): void }>();
++			const disposed = Promise.withResolvers<void>();
++			const { connection } = createElicitConnection(async () => ({ action: "cancel" }));
++			const ctx = createAcpExtensionUiContext(
++				connection,
++				() => "component-late",
++				COMPONENT_CAPABILITIES,
++				() => controller.signal,
++			);
++			const result = ctx.custom(async () => {
++				factoryReady.resolve();
++				return await released.promise;
++			});
++			await factoryReady.promise;
++			controller.abort(new Error("Late factory cancelled"));
++			await expect(result).rejects.toThrow("Late factory cancelled");
++			released.resolve({ render: () => [], invalidate() {}, dispose: () => disposed.resolve() });
++			await disposed.promise;
++		});
++		it.each([
++			FORM_CAPABILITIES,
++			{ ...FORM_CAPABILITIES, _meta: { lody: { elicitation: { version: 2, components: { version: 1 } } } } },
++		])("does not invoke custom factories without negotiated version-one components", async capabilities => {
++			const { connection } = createElicitConnection(async () => ({ action: "cancel" }));
++			const ctx = createAcpExtensionUiContext(connection, () => "component-no-capability", capabilities);
++			let invoked = false;
++			const result = await ctx.custom(() => {
++				invoked = true;
++				return { render: () => [], invalidate() {} };
++			});
++			expect(result).toBeUndefined();
++			expect(invoked).toBe(false);
++		});
+ 		it("translates select to a single-property string-enum elicitation", async () => {
+ 			const { connection, calls } = createElicitConnection(async () => ({
+ 				action: "accept",
+@@ -3447,4 +3825,43 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
+ 			refreshSpy.mockRestore();
+ 		}
+ 	}, 15_000);
++	it("advertises late prompts, executes arguments, refreshes the catalog and clears it on reconfigure", async () => {
++		const harness = await createHarness();
++		try {
++			const created = await harness.agent.newSession({
++				cwd: harness.cwdA,
++				mcpServers: [{ name: "delayed", command: BUN_EXEC, args: [FIXTURE_PATH], env: [] }],
++			});
++			const session = harness.findSession(created.sessionId)!;
++			const hasCommand = (name: string): boolean =>
++				harness.updates.some(
++					({ update }) =>
++						update.sessionUpdate === "available_commands_update" &&
++						update.availableCommands.some(command => command.name === name),
++				);
++			await pollUntil(() => hasCommand(`delayed:${DELAYED_MCP_PROMPT_NAME}`));
++			const command = session.mcpPromptCommands.find(
++				entry => entry.command.name === `delayed:${DELAYED_MCP_PROMPT_NAME}`,
++			)!;
++			harness.updates.length = 0;
++			expect(await command.command.execute(["topic=change"], {} as CustomCommandContext)).toBe(
++				`${PROMPT_RESULT} change`,
++			);
++			await pollUntil(() => hasCommand("delayed:updated_prompt"));
++			expect(session.mcpPromptCommands.map(entry => entry.command.name)).toEqual(["delayed:updated_prompt"]);
++			harness.updates.length = 0;
++			await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
++			await pollUntil(() =>
++				harness.updates.some(({ update }) => update.sessionUpdate === "available_commands_update"),
++			);
++			expect(session.mcpPromptCommands).toEqual([]);
++			const lists = harness.updates.flatMap(({ update }) =>
++				update.sessionUpdate === "available_commands_update" ? [update.availableCommands] : [],
++			);
++			expect(lists.at(-1)?.some(command => command.name.startsWith("delayed:"))).toBe(false);
++		} finally {
++			harness.abortController.abort();
++			await Bun.sleep(0);
++		}
++	}, 15_000);
+ });
+diff --git a/packages/coding-agent/test/fixtures/delayed-tool-mcp.ts b/packages/coding-agent/test/fixtures/delayed-tool-mcp.ts
+index 4e5faf8..3e25dea 100755
+--- a/packages/coding-agent/test/fixtures/delayed-tool-mcp.ts
++++ b/packages/coding-agent/test/fixtures/delayed-tool-mcp.ts
+@@ -18,6 +18,10 @@
+ import * as readline from "node:readline";
+ 
+ export const TOOL_NAME = "late_tool";
++export const PROMPT_NAME = "late_prompt";
++export const PROMPT_RESULT = "MCP_PROMPT_SENTINEL";
++let promptName = PROMPT_NAME;
++
+ export const TOOL_RESULT = "MCP_LATE_CONNECT_OK_9d21";
+ export const INITIALIZE_DELAY_MS = 450;
+ 
+@@ -28,13 +32,13 @@ type JsonRpcRequest = {
+ 	params?: Record<string, unknown>;
+ };
+ 
+-function buildResult(method: string): Record<string, unknown> {
++function buildResult(method: string, params?: Record<string, unknown>): Record<string, unknown> {
+ 	switch (method) {
+ 		case "initialize":
+ 			return {
+ 				protocolVersion: "2025-03-26",
+ 				serverInfo: { name: "delayed-tool-fixture", version: "1.0.0" },
+-				capabilities: { tools: {} },
++				capabilities: { tools: {}, prompts: { listChanged: true } },
+ 			};
+ 		case "tools/list":
+ 			return {
+@@ -46,6 +50,24 @@ function buildResult(method: string): Record<string, unknown> {
+ 					},
+ 				],
+ 			};
++		case "prompts/list":
++			return {
++				prompts: [
++					{ name: promptName, description: "A late prompt", arguments: [{ name: "topic", required: true }] },
++				],
++			};
++		case "prompts/get": {
++			const args = params?.arguments as Record<string, string> | undefined;
++			if (args?.topic === "change") {
++				promptName = "updated_prompt";
++				process.stdout.write(
++					`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/prompts/list_changed" })}\n`,
++				);
++			}
++			return {
++				messages: [{ role: "user", content: { type: "text", text: `${PROMPT_RESULT} ${args?.topic ?? ""}` } }],
++			};
++		}
+ 		case "tools/call":
+ 			return { content: [{ type: "text", text: TOOL_RESULT }], isError: false };
+ 		default:
+@@ -74,7 +96,7 @@ async function startServer(): Promise<void> {
+ 				if (markerPath) return;
+ 				await Bun.sleep(INITIALIZE_DELAY_MS);
+ 			}
+-			const response = { jsonrpc: "2.0" as const, id: msg.id, result: buildResult(msg.method) };
++			const response = { jsonrpc: "2.0" as const, id: msg.id, result: buildResult(msg.method, msg.params) };
+ 			process.stdout.write(`${JSON.stringify(response)}\n`);
+ 		})();
+ 	});
+diff --git a/packages/coding-agent/src/mcp/prompt-commands.ts b/packages/coding-agent/src/mcp/prompt-commands.ts
+new file mode 100644
+index 0000000..cf062ef
+--- /dev/null
++++ b/packages/coding-agent/src/mcp/prompt-commands.ts
+@@ -0,0 +1,53 @@
++import type { LoadedCustomCommand } from "../extensibility/custom-commands";
++import type { MCPManager } from "./manager";
++
++/**
++ * Build LoadedCustomCommand entries for all MCP prompts across connected servers.
++ * These are re-created whenever prompts change (setOnPromptsChanged callback).
++ */
++export function buildMCPPromptCommands(
++	manager: Pick<MCPManager, "getConnectedServers" | "getServerPrompts" | "executePrompt">,
++): LoadedCustomCommand[] {
++	const commands: LoadedCustomCommand[] = [];
++	for (const serverName of manager.getConnectedServers()) {
++		const prompts = manager.getServerPrompts(serverName);
++		if (!prompts?.length) continue;
++		for (const prompt of prompts) {
++			const commandName = `${serverName}:${prompt.name}`;
++			commands.push({
++				path: `mcp:${commandName}`,
++				resolvedPath: `mcp:${commandName}`,
++				source: "bundled",
++				command: {
++					name: commandName,
++					description: prompt.description ?? `MCP prompt from ${serverName}`,
++					async execute(args: string[]) {
++						const promptArgs: Record<string, string> = {};
++						for (const arg of args) {
++							const eqIdx = arg.indexOf("=");
++							if (eqIdx > 0) {
++								promptArgs[arg.slice(0, eqIdx)] = arg.slice(eqIdx + 1);
++							}
++						}
++						const result = await manager.executePrompt(serverName, prompt.name, promptArgs);
++						if (!result) return "";
++						const parts: string[] = [];
++						for (const msg of result.messages) {
++							const contentItems = Array.isArray(msg.content) ? msg.content : [msg.content];
++							for (const item of contentItems) {
++								if (item.type === "text") {
++									parts.push(item.text);
++								} else if (item.type === "resource") {
++									const resource = item.resource;
++									if (resource.text) parts.push(resource.text);
++								}
++							}
++						}
++						return parts.join("\n\n");
++					},
++				},
++			});
++		}
++	}
++	return commands;
++}
+diff --git a/packages/coding-agent/src/modes/acp/acp-collaboration.ts b/packages/coding-agent/src/modes/acp/acp-collaboration.ts
+new file mode 100644
+index 0000000..022fa1c
+--- /dev/null
++++ b/packages/coding-agent/src/modes/acp/acp-collaboration.ts
+@@ -0,0 +1,330 @@
++import * as path from "node:path";
++import { getConfigRootDir } from "@oh-my-pi/pi-utils";
++import type { ImageContent } from "@oh-my-pi/pi-ai";
++import { importRoomKey } from "../../collab/crypto";
++import { CollabHost, type CollabHostContext } from "../../collab/host";
++import {
++	COLLAB_PROTO,
++	DEFAULT_RELAY_URL,
++	parseCollabLink,
++	type CollabFrame,
++	type CollabSessionState,
++} from "../../collab/protocol";
++import { CollabSocket } from "../../collab/relay-client";
++import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
++import { SessionManager } from "../../session/session-manager";
++import type { SessionEntry, SessionHeader } from "../../session/session-entries";
++
++function previewEntry(entry: SessionEntry) {
++	const content =
++		entry.type === "message" && "content" in entry.message
++			? entry.message.content
++			: entry.type === "custom_message"
++				? entry.content
++				: undefined;
++	const text =
++		typeof content === "string"
++			? content
++			: (content
++					?.flatMap(block => (block.type === "text" ? [block.text.slice(0, 256)] : []))
++					.slice(0, 4)
++					.join("\n") ?? "");
++	return { id: entry.id, type: entry.type, text: text.slice(0, 1024) };
++}
++
++/** Owns native encrypted collaboration independently of terminal presentation. */
++export class AcpCollaboration {
++	#host: CollabHost | undefined;
++	#socket: CollabSocket | undefined;
++	#replica: SessionManager | undefined;
++	#state: CollabSessionState | undefined;
++	#readOnly = true;
++	#watching = false;
++	#preview: Array<{ id: string; type: SessionEntry["type"]; text: string }> = [];
++	#entryCount = 0;
++	#pendingRemote: { resolve(): void; reject(error: unknown): void } | undefined;
++	constructor(
++		readonly session: AgentSession,
++		readonly onRemoteEvent: (event: AgentSessionEvent) => void,
++	) {}
++	get joined(): boolean {
++		return this.#replica !== undefined && this.#socket !== undefined;
++	}
++
++	async command(
++		name: string,
++		args: string,
++		signal?: AbortSignal,
++		onWatchReady?: () => Promise<void>,
++	): Promise<unknown> {
++		const [verb, ...rest] = args.trim().split(/\s+/);
++		if (name === "join") return this.#join(args.trim(), signal);
++		if (name === "leave") {
++			await this.dispose();
++			return { role: "local" };
++		}
++		if (name !== "collab") throw new Error("Unknown collaboration command");
++		if (verb === "stop") {
++			await this.#host?.stop("sharing stopped");
++			this.#host = undefined;
++			return { role: "local" };
++		}
++		if (verb === "status") return this.#status();
++		if (verb === "watch") {
++			if (!this.#host || this.#host.ending) throw new Error("Start sharing before /collab watch");
++			this.#watching = true;
++			const waiting = Promise.withResolvers<void>();
++			const unsubscribe = this.session.subscribe(event => {
++				if (event.type === "agent_end") waiting.resolve();
++			});
++			const onAbort = () => waiting.reject(signal?.reason);
++			signal?.addEventListener("abort", onAbort, { once: true });
++			try {
++				signal?.throwIfAborted();
++				await onWatchReady?.();
++				await waiting.promise;
++			} finally {
++				this.#watching = false;
++				unsubscribe();
++				signal?.removeEventListener("abort", onAbort);
++			}
++			return undefined;
++		}
++		if (verb && verb !== "start" && verb !== "view")
++			throw new Error("Usage: /collab start|view|status|watch|stop [relayUrl]");
++		if (this.joined) throw new Error("Leave the remote session before hosting");
++		if (!this.#host || this.#host.ending) {
++			const context: CollabHostContext = {
++				session: this.session,
++				sessionManager: this.session.sessionManager,
++				settings: this.session.settings,
++				eventBus: undefined,
++				subagentEventBus: undefined,
++				collabHost: undefined,
++				showStatus: message => this.session.emitNotice("info", message, "collab"),
++				updatePendingMessagesDisplay() {},
++				ui: { requestRender() {} },
++				statusLine: {
++					setCollabStatus() {},
++					invalidate() {},
++					getCachedContextBreakdown: () => {
++						const usage = this.session.getContextUsage();
++						return {
++							usedTokens: usage?.tokens,
++							contextWindow: usage?.contextWindow ?? this.session.model?.contextWindow ?? 0,
++						};
++					},
++				},
++			};
++			const host = new CollabHost(context, { guestActionsReady: () => this.#watching });
++			context.collabHost = host;
++			this.#host = host;
++			const onAbort = () => {
++				void host.stop("start cancelled");
++			};
++			signal?.addEventListener("abort", onAbort, { once: true });
++			try {
++				signal?.throwIfAborted();
++				await host.start(rest.join(" ") || DEFAULT_RELAY_URL);
++			} catch (error) {
++				await host.stop("start failed");
++				this.#host = undefined;
++				throw error;
++			} finally {
++				signal?.removeEventListener("abort", onAbort);
++			}
++		}
++		return { ...this.#status(), link: verb === "view" ? this.#host.viewLink : this.#host.link };
++	}
++
++	#status() {
++		if (this.#host)
++			return {
++				role: "host",
++				sessionId: this.#host.sessionId,
++				connected: this.#host.relayConnected,
++				participants: this.#host.participants,
++				guestInputReady: this.#watching,
++			};
++		if (this.joined)
++			return {
++				role: "guest",
++				sessionId: this.#replica?.getSessionId(),
++				readOnly: this.#readOnly,
++				state: this.#state,
++				entries: this.#preview,
++				entryCount: this.#entryCount,
++				historyPreviewTruncated: this.#entryCount > 20,
++			};
++		return { role: "local" };
++	}
++
++	async #join(link: string, signal?: AbortSignal): Promise<unknown> {
++		if (this.#host || this.#socket) throw new Error("Already hosting or joined; leave first");
++		const parsed = parseCollabLink(link);
++		if ("error" in parsed) throw new Error(parsed.error);
++		const key = await importRoomKey(parsed.key);
++		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
++		this.#socket = socket;
++		const replicaPath = path.join(getConfigRootDir(), "collab", `acp-${crypto.randomUUID()}.jsonl`);
++		const ready = Promise.withResolvers<void>();
++		let pending: { header: SessionHeader; entries: SessionEntry[]; count: number; bytes: number } | undefined;
++		let chain = Promise.resolve();
++		const fail = (error: unknown) => {
++			ready.reject(error);
++			this.#pendingRemote?.reject(error);
++			this.#pendingRemote = undefined;
++		};
++		socket.onOpen = () =>
++			socket.send({
++				t: "hello",
++				proto: COLLAB_PROTO,
++				name: "ACP guest",
++				writeToken: parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined,
++			});
++		socket.onClose = reason => {
++			fail(new Error("Collaboration disconnected: " + reason));
++			socket.close();
++			this.#socket = undefined;
++		};
++		socket.onFrame = frame => {
++			chain = chain
++				.then(async () => {
++					if (this.#socket !== socket) return;
++					if (frame.t === "welcome") {
++						if (frame.proto !== COLLAB_PROTO || frame.entryCount < 0 || frame.entryCount > 1_000_000)
++							throw new Error("Unsupported collaboration snapshot");
++						pending = { header: frame.header, entries: [], count: frame.entryCount, bytes: 0 };
++						this.#state = frame.state;
++						this.#readOnly = frame.readOnly === true;
++						return;
++					}
++					if (frame.t === "snapshot-chunk") {
++						if (!pending) throw new Error("Orphan collaboration snapshot");
++						pending.bytes += Buffer.byteLength(JSON.stringify(frame.entries));
++						if (pending.bytes > 128 * 1024 * 1024) throw new Error("Collaboration snapshot exceeds limit");
++						pending.entries.push(...frame.entries);
++						if (pending.entries.length > pending.count) throw new Error("Invalid collaboration snapshot count");
++						if (frame.final) {
++							if (pending.entries.length !== pending.count) throw new Error("Incomplete collaboration snapshot");
++							// Flush the old replica before replacing its backing file on resync.
++							await this.#replica?.close();
++							this.#replica = undefined;
++							if (this.#socket !== socket) return;
++							await Bun.write(
++								replicaPath,
++								[pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n") + "\n",
++							);
++							const replica = SessionManager.create(
++								this.session.sessionManager.getCwd(),
++								path.dirname(replicaPath),
++							);
++							await replica.setSessionFile(replicaPath);
++							if (this.#socket !== socket) {
++								await replica.close();
++								return;
++							}
++							this.#preview = pending.entries.slice(-20).map(previewEntry);
++							this.#entryCount = pending.count;
++							this.#replica = replica;
++							pending = undefined;
++							ready.resolve();
++						}
++						return;
++					}
++					await this.#receive(frame, fail);
++				})
++				.catch(error => {
++					fail(error);
++					socket.close();
++					if (this.#socket === socket) this.#socket = undefined;
++				});
++		};
++		const onAbort = () => {
++			fail(signal?.reason);
++			socket.close();
++			this.#socket = undefined;
++		};
++		signal?.addEventListener("abort", onAbort, { once: true });
++		const timeout = setTimeout(() => fail(new Error("Collaboration join timed out")), 30_000);
++		try {
++			signal?.throwIfAborted();
++			socket.connect();
++			await ready.promise;
++			return this.#status();
++		} catch (error) {
++			socket.close();
++			this.#socket = undefined;
++			await this.#replica?.close();
++			this.#replica = undefined;
++			throw error;
++		} finally {
++			clearTimeout(timeout);
++			signal?.removeEventListener("abort", onAbort);
++		}
++	}
++
++	async #receive(frame: CollabFrame, fail: (error: unknown) => void): Promise<void> {
++		if (frame.t === "entry") {
++			if (this.#replica && !this.#replica.getEntry(frame.entry.id)) {
++				this.#replica.ingestReplicatedEntry(frame.entry);
++				this.#entryCount++;
++				this.#preview = [...this.#preview.slice(-19), previewEntry(frame.entry)];
++			}
++			return;
++		}
++		if (frame.t === "state") {
++			this.#state = frame.state;
++			return;
++		}
++		if (frame.t === "event" && this.#pendingRemote) {
++			this.onRemoteEvent(frame.event);
++			if (frame.event.type === "agent_end") {
++				this.#pendingRemote.resolve();
++				this.#pendingRemote = undefined;
++			}
++			return;
++		}
++		if (frame.t === "error") {
++			fail(new Error(frame.message));
++			return;
++		}
++		if (frame.t === "bye") {
++			fail(new Error(frame.reason));
++			await this.dispose();
++		}
++	}
++
++	async prompt(text: string, images: ImageContent[], signal?: AbortSignal): Promise<void> {
++		if (!this.joined || !this.#socket) throw new Error("Remote session is disconnected");
++		if (this.#readOnly) throw new Error("This collaboration link is read-only");
++		if (this.#pendingRemote) throw new Error("Remote prompt is already active");
++		const completion = Promise.withResolvers<void>();
++		this.#pendingRemote = completion;
++		const onAbort = () => {
++			this.#socket?.send({ t: "abort" });
++			completion.reject(signal?.reason);
++			this.#pendingRemote = undefined;
++		};
++		signal?.addEventListener("abort", onAbort, { once: true });
++		try {
++			signal?.throwIfAborted();
++			this.#socket.send({ t: "prompt", text, images });
++			await completion.promise;
++		} finally {
++			signal?.removeEventListener("abort", onAbort);
++			if (this.#pendingRemote === completion) this.#pendingRemote = undefined;
++		}
++	}
++
++	async dispose(): Promise<void> {
++		this.#pendingRemote?.reject(new Error("Left remote session"));
++		this.#pendingRemote = undefined;
++		this.#socket?.close();
++		this.#socket = undefined;
++		await this.#replica?.close();
++		this.#replica = undefined;
++		await this.#host?.stop("ACP session closed");
++		this.#host = undefined;
++	}
++}
+diff --git a/packages/coding-agent/src/modes/acp/acp-components.ts b/packages/coding-agent/src/modes/acp/acp-components.ts
+new file mode 100644
+index 0000000..1c259bd
+--- /dev/null
++++ b/packages/coding-agent/src/modes/acp/acp-components.ts
+@@ -0,0 +1,194 @@
++import { TUI, type Terminal } from "@oh-my-pi/pi-tui";
++import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
++import { ensureThemeSync, getCurrentThemeName, theme, type Theme } from "@oh-my-pi/pi-tui/theme";
++import type { AgentSideConnection } from "@oh-my-pi/pi-utils/acp";
++import type { LodyComponentDocument, LodyComponentEvent, LodyElicitationMeta } from "acp-extension-core";
++import { z } from "zod";
++import type {
++	ExtensionCustomOptions,
++	ExtensionUIContext,
++	ExtensionUiComponent,
++} from "../../extensibility/extensions/types";
++
++/** An in-memory component host: ACP stdout always remains a JSON-RPC stream. */
++class ComponentTerminal implements Terminal {
++	columns = 80;
++	rows = 24;
++	kittyProtocolActive = false;
++	kittyEnableSequence = null;
++	appearance = undefined;
++	start(): void {}
++	stop(): void {}
++	write(): void {}
++	moveBy(): void {}
++	hideCursor(): void {}
++	showCursor(): void {}
++	clearLine(): void {}
++	clearFromCursor(): void {}
++	clearScreen(): void {}
++	setTitle(): void {}
++	setProgress(): void {}
++	onAppearanceChange(): void {}
++	async drainInput(): Promise<void> {}
++}
++class ComponentTui extends TUI {
++	override requestRender(): void {}
++}
++
++function keyInput(key: string): string | undefined {
++	const special: Record<string, string> = {
++		up: "\x1b[A",
++		down: "\x1b[B",
++		left: "\x1b[D",
++		right: "\x1b[C",
++		enter: "\r",
++		escape: "\x1b",
++		esc: "\x1b",
++		tab: "\t",
++		space: " ",
++		backspace: "\x7f",
++	};
++	if (special[key]) return special[key];
++	if (key.length === 1) return key;
++	// CSI-u preserves Ctrl+I/J/M instead of collapsing them to Tab/Enter.
++	if (/^ctrl\+[a-z]$/.test(key)) return `\x1b[${key.charCodeAt(5)};5u`;
++	return undefined;
++}
++const eventSchema: z.ZodType<LodyComponentEvent> = z
++	.object({
++		version: z.literal(1),
++		componentId: z.string().min(1).max(128),
++		revision: z.number().int().nonnegative(),
++		input: z.string().max(4096),
++	})
++	.strict();
++
++/** Present a native custom component through negotiated, inert Core GUI documents. */
++export function createAcpComponentPresenter(
++	connection: AgentSideConnection,
++	getSessionId: () => string,
++	getTurnSignal: () => AbortSignal | undefined,
++): ExtensionUIContext["custom"] {
++	return async <T>(
++		factory: (
++			tui: TUI,
++			theme: Theme,
++			keybindings: KeybindingsManager,
++			done: (result: T) => void,
++		) => ExtensionUiComponent | Promise<ExtensionUiComponent>,
++		options?: ExtensionCustomOptions,
++	): Promise<T> => {
++		const turnSignal = getTurnSignal();
++		const signal = AbortSignal.any([
++			connection.signal,
++			...(options?.signal ? [options.signal] : []),
++			...(turnSignal ? [turnSignal] : []),
++		]);
++		signal.throwIfAborted();
++		ensureThemeSync();
++		const tui = new ComponentTui(new ComponentTerminal(), false);
++		const keybindings = KeybindingsManager.create();
++		let done = false;
++		let result: T | undefined;
++		const completion = Promise.withResolvers<void>();
++		const aborted = Promise.withResolvers<never>();
++		const onAbort = () => aborted.reject(signal.reason);
++		signal.addEventListener("abort", onAbort, { once: true });
++		// Observe rejection even when the factory fails before the first frame.
++		void aborted.promise.catch(() => {});
++		let component: ExtensionUiComponent | undefined;
++		const id = crypto.randomUUID();
++		let revision = 0;
++		try {
++			component = await Promise.race([
++				Promise.resolve(
++					factory(tui, theme, keybindings, value => {
++						done = true;
++						result = value;
++						completion.resolve();
++					}),
++				).then(created => {
++					if (signal.aborted) {
++						created.dispose?.();
++						signal.throwIfAborted();
++					}
++					return created;
++				}),
++				aborted.promise,
++			]);
++			while (!done) {
++				const bindings = (
++					["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const
++				).flatMap(action =>
++					keybindings.getKeys(action).flatMap(key => {
++						const input = keyInput(key);
++						return input === undefined
++							? []
++							: [
++									{
++										key: key.replace("escape", "esc"),
++										label: keybindings.getDefinition(action).description ?? action,
++										input,
++									},
++								];
++					}),
++				);
++				const lines = component
++					.render(80)
++					.map(line => Bun.stripANSI(line).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""));
++				if (lines.length > 128 || lines.join("\n").length > 65_536)
++					throw new Error("Custom component exceeds ACP frame limit");
++				const document: LodyComponentDocument = {
++					version: 1,
++					id,
++					revision,
++					title: "Agent component",
++					theme: {
++						name: getCurrentThemeName() ?? "dark",
++						foreground: theme.getColorHex("text"),
++						background: theme.getBgHex("userMessageBg"),
++						accent: theme.getColorHex("accent"),
++					},
++					nodes: [
++						{ type: "text", text: lines.join("\n") },
++						...bindings.map((binding, index) => ({
++							type: "button" as const,
++							id: `key-${index}`,
++							label: binding.label,
++							input: binding.input,
++						})),
++						{ type: "input", id: "text", label: "Text input" },
++					],
++					keybindings: bindings,
++				};
++				const metadata: LodyElicitationMeta = { version: 1, component: document };
++				if (bindings.length > 128 || Buffer.byteLength(JSON.stringify(document)) > 131_072)
++					throw new Error("Custom component exceeds ACP document limit");
++				const response = await Promise.race([
++					connection.unstable_createElicitation({
++						mode: "form",
++						sessionId: getSessionId(),
++						message: document.title,
++						requestedSchema: { type: "object", properties: { event: { type: "string" } }, required: ["event"] },
++						_meta: { lody: { elicitation: metadata } },
++					}),
++					completion.promise.then(() => undefined),
++					aborted.promise,
++				]);
++				if (done) break;
++				if (!response) return undefined as T;
++				if (response.action !== "accept" || typeof response.content?.event !== "string") return undefined as T;
++				const event = eventSchema.parse(JSON.parse(response.content.event));
++				if (event.componentId !== id || event.revision !== revision)
++					throw new Error("Stale or foreign component input");
++				component.handleInput?.(event.input);
++				revision++;
++			}
++			return result as T;
++		} finally {
++			signal.removeEventListener("abort", onAbort);
++			component?.dispose?.();
++			tui.stop();
++		}
++	};
++}
+diff --git a/packages/coding-agent/src/slash-commands/builtin-commits.ts b/packages/coding-agent/src/slash-commands/builtin-commits.ts
+new file mode 100644
+index 0000000..a11492c
+--- /dev/null
++++ b/packages/coding-agent/src/slash-commands/builtin-commits.ts
+@@ -0,0 +1,39 @@
++import * as path from "node:path";
++import { runSplitCommit } from "../commit/agentic";
++import { validateSplitCommitPlan } from "../commit/agentic/tools/split-commit";
++import { commandConsumed, parseSubcommand, usage } from "./helpers/parse";
++import type { SlashCommandSpec } from "./types";
++
++export const BUILTIN_COMMIT_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
++	{
++		name: "commit-plan",
++		description: "Validate or apply a reviewed atomic commit plan",
++		allowArgs: true,
++		acpInputHint: "validate|apply <plan.json>",
++		handle: async (command, runtime) => {
++			const { verb, rest } = parseSubcommand(command.args);
++			if ((verb !== "validate" && verb !== "apply") || !rest.trim())
++				return usage("Usage: /commit-plan validate|apply <plan.json>", runtime);
++			runtime.signal?.throwIfAborted();
++			const input: unknown = await Bun.file(path.resolve(runtime.cwd, rest.trim())).json();
++			const validation = await validateSplitCommitPlan(runtime.cwd, input);
++			const result = validation.details;
++			if (!result) throw new Error("Commit plan validation did not return a result");
++			if (verb === "validate" || !result.valid || !result.proposal) {
++				await runtime.output(JSON.stringify(result));
++				return commandConsumed();
++			}
++			const confirm = runtime.confirm;
++			if (!confirm) return usage("Commit plan requires an operator confirmation supported by this client.", runtime);
++			await runSplitCommit(result.proposal, {
++				cwd: runtime.cwd,
++				dryRun: false,
++				push: false,
++				signal: runtime.signal,
++				output: runtime.output,
++				confirm: plan => confirm("Apply atomic commit plan", JSON.stringify(plan, null, 2)),
++			});
++			return commandConsumed();
++		},
++	},
++];
+diff --git a/packages/coding-agent/src/slash-commands/builtin-management.ts b/packages/coding-agent/src/slash-commands/builtin-management.ts
+new file mode 100644
+index 0000000..8dbb75b
+--- /dev/null
++++ b/packages/coding-agent/src/slash-commands/builtin-management.ts
+@@ -0,0 +1,48 @@
++import { runOmpManagementMethod } from "./native-management";
++import { commandConsumed, parseSubcommand, usage } from "./helpers/parse";
++import type { SlashCommandSpec } from "./types";
++
++/** The same native operations are callable from ACP and the terminal palette. */
++export const BUILTIN_MANAGEMENT_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
++	{
++		name: "omp",
++		description: "Inspect native sessions, projects, usage, extensions, and speech models",
++		allowArgs: true,
++		acpInputHint: "sessions|projects|chats|usage|extensions|extension on|off <provider>|speech-models",
++		handle: async (command, runtime) => {
++			const { verb, rest } = parseSubcommand(command.args);
++			const methods: Record<string, string> = {
++				sessions: "_omp/sessions/listAll",
++				projects: "_omp/projects/list",
++				chats: "_omp/chats/byCwd",
++				usage: "_omp/usage",
++				extensions: "_omp/extensions",
++				"speech-models": "speech.models.list",
++			};
++			let method = methods[verb];
++			const params: Record<string, unknown> = { cwd: runtime.cwd };
++			if (verb === "extension") {
++				const { verb: action, rest: providerId } = parseSubcommand(rest);
++				if ((action !== "on" && action !== "off") || !providerId.trim()) {
++					return usage("Usage: /omp extension on|off <provider>", runtime);
++				}
++				method = "_omp/extensions/toggle";
++				params.providerId = providerId.trim();
++				params.enabled = action === "on";
++			} else if (rest.trim() || !method) {
++				return usage(
++					"Usage: /omp sessions|projects|chats|usage|extensions|extension on|off <provider>|speech-models",
++					runtime,
++				);
++			}
++			await runtime.sessionManager.flush();
++			const result = await runOmpManagementMethod(method, params, runtime.session);
++			if (verb === "extension") {
++				await runtime.settings.flush();
++				await runtime.reloadPlugins();
++			}
++			await runtime.output(JSON.stringify(result));
++			return commandConsumed();
++		},
++	},
++];
+diff --git a/packages/coding-agent/src/slash-commands/native-management.ts b/packages/coding-agent/src/slash-commands/native-management.ts
+new file mode 100644
+index 0000000..5f1ce39
+--- /dev/null
++++ b/packages/coding-agent/src/slash-commands/native-management.ts
+@@ -0,0 +1,163 @@
++import { type SessionInfo } from "@oh-my-pi/pi-utils/acp";
++import { disableProvider, enableProvider } from "../capability";
++import { Settings } from "../config/settings";
++import { cfgDisabledExtensions } from "../extensibility/settings";
++import { loadAllExtensions } from "../modes/components/extensions/state-manager";
++import type { AgentSession } from "../session/agent-session";
++import type { SessionInfo as StoredSessionInfo } from "../session/session-listing";
++import { SessionManager } from "../session/session-manager";
++import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../stt/models";
++import { DEFAULT_TTS_VOICE, TTS_LOCAL_MODELS, TTS_LOCAL_VOICE_OPTIONS } from "../tts/models";
++
++const SPEECH_MODELS_LIST_METHOD = "speech.models.list";
++
++export function toSessionInfo(session: StoredSessionInfo): SessionInfo {
++	return {
++		sessionId: session.id,
++		cwd: session.cwd,
++		title: session.title,
++		updatedAt: session.modified.toISOString(),
++		_meta: { messageCount: session.messageCount, size: session.size },
++	};
++}
++
++type AcpSpeechOption = {
++	value: string;
++	label: string;
++	description?: string;
++};
++
++type AcpSpeechVoiceOption = {
++	value: string;
++	label: string;
++};
++
++type AcpSpeechTtsModelOption = AcpSpeechOption & {
++	voices: AcpSpeechVoiceOption[];
++};
++
++export function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
++	const localSelector = (modelId: string) => `local/${modelId}`;
++	const defaultSpeechModel = localSelector(TTS_LOCAL_MODELS[0].key);
++	const defaultDictationModel = localSelector(DEFAULT_STT_MODEL_KEY);
++	const voices = TTS_LOCAL_VOICE_OPTIONS.map(({ value, label }) => ({ value, label }));
++	return {
++		settings: {
++			speechToTextModel: "modelRoles.dictation",
++			textToSpeechModel: "modelRoles.speech",
++			textToSpeechVoice: "tts.localVoice",
++			speechVoice: "speech.voice",
++		},
++		defaults: {
++			speechToTextModel: defaultDictationModel,
++			textToSpeechModel: defaultSpeechModel,
++			voice: DEFAULT_TTS_VOICE,
++		},
++		speechToText: {
++			setting: "modelRoles.dictation",
++			defaultValue: defaultDictationModel,
++			models: STT_MODELS.map(({ key, label, description }) => ({
++				value: localSelector(key),
++				label,
++				description,
++			})),
++		},
++		textToSpeech: {
++			modelSetting: "modelRoles.speech",
++			voiceSetting: "tts.localVoice",
++			speechVoiceSetting: "speech.voice",
++			defaultModel: defaultSpeechModel,
++			defaultVoice: DEFAULT_TTS_VOICE,
++			models: TTS_LOCAL_MODELS.map(({ key, label, description, voices: modelVoices }): AcpSpeechTtsModelOption => ({
++				value: localSelector(key),
++				label,
++				description,
++				voices: modelVoices.map(({ id, label: voiceLabel }) => ({ value: id, label: voiceLabel })),
++			})),
++			voices,
++		},
++	};
++}
++
++export async function runOmpManagementMethod(
++	method: string,
++	params: Record<string, unknown>,
++	session?: AgentSession,
++): Promise<Record<string, unknown>> {
++	switch (method) {
++		case SPEECH_MODELS_LIST_METHOD:
++			return buildAcpSpeechModelsCatalog();
++		case "_omp/sessions/listAll": {
++			const limit = typeof params.limit === "number" ? Math.max(1, Math.min(5000, params.limit as number)) : 1000;
++			const sessions = await SessionManager.listAll();
++			const sorted = sessions.sort((l, r) => r.modified.getTime() - l.modified.getTime()).slice(0, limit);
++			return {
++				sessions: sorted.map(s => toSessionInfo(s)),
++				total: sessions.length,
++			};
++		}
++		case "_omp/projects/list": {
++			const sessions = await SessionManager.listAll();
++			const buckets = new Map<
++				string,
++				{ cwd: string; sessionCount: number; lastActivityAt: number; lastTitle: string }
++			>();
++			for (const s of sessions) {
++				if (!s.cwd) continue;
++				const ts = s.modified.getTime();
++				const existing = buckets.get(s.cwd);
++				if (existing) {
++					existing.sessionCount += 1;
++					if (ts > existing.lastActivityAt) {
++						existing.lastActivityAt = ts;
++						existing.lastTitle = s.title ?? "";
++					}
++				} else {
++					buckets.set(s.cwd, {
++						cwd: s.cwd,
++						sessionCount: 1,
++						lastActivityAt: ts,
++						lastTitle: s.title ?? "",
++					});
++				}
++			}
++			const projects = Array.from(buckets.values()).sort((a, b) => b.lastActivityAt - a.lastActivityAt);
++			return { projects, totalSessions: sessions.length };
++		}
++		case "_omp/chats/byCwd": {
++			const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
++			if (!cwd) throw new Error("cwd required");
++			const limit = typeof params.limit === "number" ? Math.max(1, Math.min(500, params.limit as number)) : 100;
++			const sessions = await SessionManager.list(cwd);
++			const sorted = sessions.sort((l, r) => r.modified.getTime() - l.modified.getTime()).slice(0, limit);
++			return { sessions: sorted.map(s => toSessionInfo(s)) };
++		}
++		case "_omp/usage": {
++			const target = session;
++			if (!target) {
++				return { reports: [] };
++			}
++			const reports = await target.fetchUsageReports();
++			return { reports: reports ?? [] };
++		}
++		case "_omp/extensions": {
++			const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
++			const sm = session?.settings ?? (await Settings.init());
++			const disabledIds = cfgDisabledExtensions.get(sm);
++			const extensions = await loadAllExtensions(cwd, disabledIds);
++			return { extensions: extensions as unknown as Array<{ [key: string]: unknown }> };
++		}
++		case "_omp/extensions/toggle": {
++			const providerId = params.providerId;
++			if (typeof providerId !== "string") throw new Error("providerId required");
++			if (params.enabled === false) {
++				disableProvider(providerId);
++				return { enabled: false };
++			}
++			enableProvider(providerId);
++			return { enabled: true };
++		}
++		default:
++			throw new Error(`Unknown ACP ext method: ${method}`);
++	}
++}
+diff --git a/packages/coding-agent/test/mcp-prompt-commands.test.ts b/packages/coding-agent/test/mcp-prompt-commands.test.ts
+new file mode 100644
+index 0000000..843bcc0
+--- /dev/null
++++ b/packages/coding-agent/test/mcp-prompt-commands.test.ts
+@@ -0,0 +1,49 @@
++import { describe, expect, it } from "bun:test";
++import type { CustomCommandContext } from "../src/extensibility/custom-commands";
++import type { MCPManager } from "../src/mcp/manager";
++import { buildMCPPromptCommands } from "../src/mcp/prompt-commands";
++
++describe("MCP prompt slash commands", () => {
++	const context = {} as CustomCommandContext;
++	it("preserves server namespaces, arguments and textual prompt content", async () => {
++		const calls: Array<{ server: string; prompt: string; args?: Record<string, string> }> = [];
++		const manager: Pick<MCPManager, "getConnectedServers" | "getServerPrompts" | "executePrompt"> = {
++			getConnectedServers: () => ["first", "second", "empty"],
++			getServerPrompts: server =>
++				server === "empty" ? undefined : [{ name: "review", description: "Review a topic" }],
++			async executePrompt(server, prompt, args) {
++				calls.push({ server, prompt, args });
++				return {
++					messages: [
++						{ role: "user", content: { type: "text", text: "Prompt text" } },
++						{
++							role: "user",
++							content: { type: "resource", resource: { uri: "fixture://topic", text: "Resource text" } },
++						},
++						{ role: "user", content: { type: "image", data: "fixture", mimeType: "image/png" } },
++					],
++				};
++			},
++		};
++		const commands = buildMCPPromptCommands(manager);
++		expect(commands.map(entry => entry.command.name)).toEqual(["first:review", "second:review"]);
++		expect(commands[0]?.command.description).toBe("Review a topic");
++		expect(await commands[1]!.command.execute(["topic=a=b", "empty=", "ignored"], context)).toBe(
++			"Prompt text\n\nResource text",
++		);
++		expect(calls).toEqual([{ server: "second", prompt: "review", args: { topic: "a=b", empty: "" } }]);
++	});
++
++	it("handles a prompt server disappearing before invocation", async () => {
++		const manager: Pick<MCPManager, "getConnectedServers" | "getServerPrompts" | "executePrompt"> = {
++			getConnectedServers: () => ["fixture"],
++			getServerPrompts: () => [{ name: "review" }],
++			async executePrompt() {
++				return undefined;
++			},
++		};
++		const [command] = buildMCPPromptCommands(manager);
++		expect(command?.command.description).toBe("MCP prompt from fixture");
++		expect(await command!.command.execute([], context)).toBe("");
++	});
++});

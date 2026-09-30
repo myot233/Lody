@@ -1,0 +1,423 @@
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index fb66193..053a20e 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [Unreleased]
+ 
++### Fixed
++
++- ACP sessions now advertise and run prompts from client-provided MCP servers as slash commands, including prompts arriving after server startup. Reconfiguring a session clears stale prompt commands.
++
+ ## [18.4.3] - 2026-09-28
+ 
+ ### Added
+diff --git a/packages/coding-agent/src/modes/acp/acp-agent.ts b/packages/coding-agent/src/modes/acp/acp-agent.ts
+index 45d55d0..8b85c4f 100644
+--- a/packages/coding-agent/src/modes/acp/acp-agent.ts
++++ b/packages/coding-agent/src/modes/acp/acp-agent.ts
+@@ -56,6 +56,7 @@ import { runExtensionCompact } from "../../extensibility/extensions/compact-hand
+ import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+ import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
+ import { MCPManager } from "../../mcp/manager";
++import { buildMCPPromptCommands } from "../../mcp/prompt-commands";
+ import type { MCPServerConfig } from "../../mcp/types";
+ import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
+ import { theme } from "@oh-my-pi/pi-tui/theme";
+@@ -2650,14 +2651,17 @@ export class AcpAgent implements Agent {
+ 	}
+ 
+ 	async #configureMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
+-		if (record.mcpManager) {
+-			await record.mcpManager.disconnectAll();
++		const previousManager = record.mcpManager;
++		record.mcpManager = undefined;
++		if (previousManager) {
++			await previousManager.disconnectAll();
+ 		}
+ 		// Drain any in-flight refresh queued by a previous configuration: a refresh
+ 		// that already passed its manager guard could otherwise finish applying a
+ 		// stale tool set after this reconfiguration installs the new one.
+ 		await record.mcpRefreshChain;
+ 		record.mcpRefreshChain = undefined;
++		record.session.setMCPPromptCommands([]);
+ 		if (servers.length === 0) {
+ 			record.mcpManager = undefined;
+ 			await record.session.refreshMCPTools([]);
+@@ -2689,6 +2693,10 @@ export class AcpAgent implements Agent {
+ 			// Failures are logged once via the stored chain's catch above.
+ 			enqueueMcpToolsRefresh().catch(() => {});
+ 		});
++		manager.setOnPromptsChanged(() => {
++			if (record.mcpManager !== manager) return;
++			record.session.setMCPPromptCommands(buildMCPPromptCommands(manager));
++		});
+ 		const configs: MCPConfigMap = {};
+ 		const sources: MCPSourceMap = {};
+ 		for (const server of servers) {
+@@ -2711,6 +2719,7 @@ export class AcpAgent implements Agent {
+ 		}
+ 
+ 		record.mcpManager = manager;
++		record.session.setMCPPromptCommands(buildMCPPromptCommands(manager));
+ 		await enqueueMcpToolsRefresh();
+ 	}
+ 
+diff --git a/packages/coding-agent/src/sdk.ts b/packages/coding-agent/src/sdk.ts
+index d5f0649..8943755 100644
+--- a/packages/coding-agent/src/sdk.ts
++++ b/packages/coding-agent/src/sdk.ts
+@@ -94,7 +94,6 @@ import { defaultEvalSessionId } from "./eval/session-id";
+ import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
+ import {
+ 	type CustomCommandsLoadResult,
+-	type LoadedCustomCommand,
+ 	loadCustomCommands as loadCustomCommandsInternal,
+ } from "./extensibility/custom-commands";
+ import { discoverCustomToolPaths, loadCustomTools, type ToolPathWithSource } from "./extensibility/custom-tools";
+@@ -146,6 +145,7 @@ import {
+ import { parseMCPToolName } from "@oh-my-pi/pi-tui/tools/mcp";
+ import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
+ import { resolveMCPToolAlias } from "./mcp/tool-bridge";
++import { buildMCPPromptCommands } from "./mcp/prompt-commands";
+ import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
+ import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
+ import type { MnemopiSessionState } from "./mnemopi/state";
+@@ -1443,55 +1443,6 @@ function createCustomToolsExtension(tools: CustomTool[], sourcePaths?: ReadonlyM
+ 
+ // Factory
+ 
+-/**
+- * Build LoadedCustomCommand entries for all MCP prompts across connected servers.
+- * These are re-created whenever prompts change (setOnPromptsChanged callback).
+- */
+-function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
+-	const commands: LoadedCustomCommand[] = [];
+-	for (const serverName of manager.getConnectedServers()) {
+-		const prompts = manager.getServerPrompts(serverName);
+-		if (!prompts?.length) continue;
+-		for (const prompt of prompts) {
+-			const commandName = `${serverName}:${prompt.name}`;
+-			commands.push({
+-				path: `mcp:${commandName}`,
+-				resolvedPath: `mcp:${commandName}`,
+-				source: "bundled",
+-				command: {
+-					name: commandName,
+-					description: prompt.description ?? `MCP prompt from ${serverName}`,
+-					async execute(args: string[]) {
+-						const promptArgs: Record<string, string> = {};
+-						for (const arg of args) {
+-							const eqIdx = arg.indexOf("=");
+-							if (eqIdx > 0) {
+-								promptArgs[arg.slice(0, eqIdx)] = arg.slice(eqIdx + 1);
+-							}
+-						}
+-						const result = await manager.executePrompt(serverName, prompt.name, promptArgs);
+-						if (!result) return "";
+-						const parts: string[] = [];
+-						for (const msg of result.messages) {
+-							const contentItems = Array.isArray(msg.content) ? msg.content : [msg.content];
+-							for (const item of contentItems) {
+-								if (item.type === "text") {
+-									parts.push(item.text);
+-								} else if (item.type === "resource") {
+-									const resource = item.resource;
+-									if (resource.text) parts.push(resource.text);
+-								}
+-							}
+-						}
+-						return parts.join("\n\n");
+-					},
+-				},
+-			});
+-		}
+-	}
+-	return commands;
+-}
+-
+ /** Dependencies used to construct an isolated auto-learn capture agent. */
+ export interface AutoLearnCaptureRunnerOptions {
+ 	sourceAgent: Agent;
+diff --git a/packages/coding-agent/test/acp-agent.test.ts b/packages/coding-agent/test/acp-agent.test.ts
+index 4d790d1..95e4b80 100644
+--- a/packages/coding-agent/test/acp-agent.test.ts
++++ b/packages/coding-agent/test/acp-agent.test.ts
+@@ -6,6 +6,10 @@ import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
+ import type { Model } from "@oh-my-pi/pi-ai";
+ import { buildModel } from "@oh-my-pi/pi-catalog/build";
+ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import type {
++	CustomCommandContext,
++	LoadedCustomCommand,
++} from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands";
+ import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+ import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
+ import {
+@@ -41,7 +45,11 @@ import {
+ 	zPromptResponse,
+ 	zSessionNotification,
+ } from "@oh-my-pi/pi-utils/acp";
+-import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp";
++import {
++	PROMPT_NAME as DELAYED_MCP_PROMPT_NAME,
++	PROMPT_RESULT,
++	TOOL_NAME as DELAYED_MCP_TOOL_NAME,
++} from "./fixtures/delayed-tool-mcp";
+ 
+ import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
+ 
+@@ -120,7 +128,14 @@ class FakeAgentSession {
+ 	agent: { sessionId: string; waitForIdle: () => Promise<void> };
+ 	model: Model | undefined;
+ 	thinkingLevel: string | undefined;
+-	customCommands: [] = [];
++	customCommands: LoadedCustomCommand[] = [];
++	mcpPromptCommands: LoadedCustomCommand[] = [];
++	#commandMetadataListeners = new Set<() => void>();
++	setMCPPromptCommands(commands: LoadedCustomCommand[]): void {
++		this.customCommands = [...this.customCommands.filter(command => !command.path?.startsWith("mcp:")), ...commands];
++		this.mcpPromptCommands = commands;
++		for (const listener of this.#commandMetadataListeners) listener();
++	}
+ 	extensionRunner = undefined;
+ 	isStreaming = false;
+ 	queuedMessageCount = 0;
+@@ -137,8 +152,11 @@ class FakeAgentSession {
+ 	skillsSettings = { enableSkillCommands: true };
+ 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
+ 	async refreshSkillsAndCommands(): Promise<void> {}
+-	subscribeCommandMetadataChanged(_listener: () => void): () => void {
+-		return () => {};
++	subscribeCommandMetadataChanged(listener: () => void): () => void {
++		this.#commandMetadataListeners.add(listener);
++		return () => {
++			this.#commandMetadataListeners.delete(listener);
++		};
+ 	}
+ 	planModeState: PlanModeState | undefined;
+ 	waitForIdleCalls = 0;
+@@ -3447,4 +3465,43 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
+ 			refreshSpy.mockRestore();
+ 		}
+ 	}, 15_000);
++	it("advertises late prompts, executes arguments, refreshes the catalog and clears it on reconfigure", async () => {
++		const harness = await createHarness();
++		try {
++			const created = await harness.agent.newSession({
++				cwd: harness.cwdA,
++				mcpServers: [{ name: "delayed", command: BUN_EXEC, args: [FIXTURE_PATH], env: [] }],
++			});
++			const session = harness.findSession(created.sessionId)!;
++			const hasCommand = (name: string): boolean =>
++				harness.updates.some(
++					({ update }) =>
++						update.sessionUpdate === "available_commands_update" &&
++						update.availableCommands.some(command => command.name === name),
++				);
++			await pollUntil(() => hasCommand(`delayed:${DELAYED_MCP_PROMPT_NAME}`));
++			const command = session.mcpPromptCommands.find(
++				entry => entry.command.name === `delayed:${DELAYED_MCP_PROMPT_NAME}`,
++			)!;
++			harness.updates.length = 0;
++			expect(await command.command.execute(["topic=change"], {} as CustomCommandContext)).toBe(
++				`${PROMPT_RESULT} change`,
++			);
++			await pollUntil(() => hasCommand("delayed:updated_prompt"));
++			expect(session.mcpPromptCommands.map(entry => entry.command.name)).toEqual(["delayed:updated_prompt"]);
++			harness.updates.length = 0;
++			await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
++			await pollUntil(() =>
++				harness.updates.some(({ update }) => update.sessionUpdate === "available_commands_update"),
++			);
++			expect(session.mcpPromptCommands).toEqual([]);
++			const lists = harness.updates.flatMap(({ update }) =>
++				update.sessionUpdate === "available_commands_update" ? [update.availableCommands] : [],
++			);
++			expect(lists.at(-1)?.some(command => command.name.startsWith("delayed:"))).toBe(false);
++		} finally {
++			harness.abortController.abort();
++			await Bun.sleep(0);
++		}
++	}, 15_000);
+ });
+diff --git a/packages/coding-agent/test/fixtures/delayed-tool-mcp.ts b/packages/coding-agent/test/fixtures/delayed-tool-mcp.ts
+index 4e5faf8..3e25dea 100755
+--- a/packages/coding-agent/test/fixtures/delayed-tool-mcp.ts
++++ b/packages/coding-agent/test/fixtures/delayed-tool-mcp.ts
+@@ -18,6 +18,10 @@
+ import * as readline from "node:readline";
+ 
+ export const TOOL_NAME = "late_tool";
++export const PROMPT_NAME = "late_prompt";
++export const PROMPT_RESULT = "MCP_PROMPT_SENTINEL";
++let promptName = PROMPT_NAME;
++
+ export const TOOL_RESULT = "MCP_LATE_CONNECT_OK_9d21";
+ export const INITIALIZE_DELAY_MS = 450;
+ 
+@@ -28,13 +32,13 @@ type JsonRpcRequest = {
+ 	params?: Record<string, unknown>;
+ };
+ 
+-function buildResult(method: string): Record<string, unknown> {
++function buildResult(method: string, params?: Record<string, unknown>): Record<string, unknown> {
+ 	switch (method) {
+ 		case "initialize":
+ 			return {
+ 				protocolVersion: "2025-03-26",
+ 				serverInfo: { name: "delayed-tool-fixture", version: "1.0.0" },
+-				capabilities: { tools: {} },
++				capabilities: { tools: {}, prompts: { listChanged: true } },
+ 			};
+ 		case "tools/list":
+ 			return {
+@@ -46,6 +50,24 @@ function buildResult(method: string): Record<string, unknown> {
+ 					},
+ 				],
+ 			};
++		case "prompts/list":
++			return {
++				prompts: [
++					{ name: promptName, description: "A late prompt", arguments: [{ name: "topic", required: true }] },
++				],
++			};
++		case "prompts/get": {
++			const args = params?.arguments as Record<string, string> | undefined;
++			if (args?.topic === "change") {
++				promptName = "updated_prompt";
++				process.stdout.write(
++					`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/prompts/list_changed" })}\n`,
++				);
++			}
++			return {
++				messages: [{ role: "user", content: { type: "text", text: `${PROMPT_RESULT} ${args?.topic ?? ""}` } }],
++			};
++		}
+ 		case "tools/call":
+ 			return { content: [{ type: "text", text: TOOL_RESULT }], isError: false };
+ 		default:
+@@ -74,7 +96,7 @@ async function startServer(): Promise<void> {
+ 				if (markerPath) return;
+ 				await Bun.sleep(INITIALIZE_DELAY_MS);
+ 			}
+-			const response = { jsonrpc: "2.0" as const, id: msg.id, result: buildResult(msg.method) };
++			const response = { jsonrpc: "2.0" as const, id: msg.id, result: buildResult(msg.method, msg.params) };
+ 			process.stdout.write(`${JSON.stringify(response)}\n`);
+ 		})();
+ 	});
+diff --git a/packages/coding-agent/src/mcp/prompt-commands.ts b/packages/coding-agent/src/mcp/prompt-commands.ts
+new file mode 100644
+index 0000000..cf062ef
+--- /dev/null
++++ b/packages/coding-agent/src/mcp/prompt-commands.ts
+@@ -0,0 +1,53 @@
++import type { LoadedCustomCommand } from "../extensibility/custom-commands";
++import type { MCPManager } from "./manager";
++
++/**
++ * Build LoadedCustomCommand entries for all MCP prompts across connected servers.
++ * These are re-created whenever prompts change (setOnPromptsChanged callback).
++ */
++export function buildMCPPromptCommands(
++	manager: Pick<MCPManager, "getConnectedServers" | "getServerPrompts" | "executePrompt">,
++): LoadedCustomCommand[] {
++	const commands: LoadedCustomCommand[] = [];
++	for (const serverName of manager.getConnectedServers()) {
++		const prompts = manager.getServerPrompts(serverName);
++		if (!prompts?.length) continue;
++		for (const prompt of prompts) {
++			const commandName = `${serverName}:${prompt.name}`;
++			commands.push({
++				path: `mcp:${commandName}`,
++				resolvedPath: `mcp:${commandName}`,
++				source: "bundled",
++				command: {
++					name: commandName,
++					description: prompt.description ?? `MCP prompt from ${serverName}`,
++					async execute(args: string[]) {
++						const promptArgs: Record<string, string> = {};
++						for (const arg of args) {
++							const eqIdx = arg.indexOf("=");
++							if (eqIdx > 0) {
++								promptArgs[arg.slice(0, eqIdx)] = arg.slice(eqIdx + 1);
++							}
++						}
++						const result = await manager.executePrompt(serverName, prompt.name, promptArgs);
++						if (!result) return "";
++						const parts: string[] = [];
++						for (const msg of result.messages) {
++							const contentItems = Array.isArray(msg.content) ? msg.content : [msg.content];
++							for (const item of contentItems) {
++								if (item.type === "text") {
++									parts.push(item.text);
++								} else if (item.type === "resource") {
++									const resource = item.resource;
++									if (resource.text) parts.push(resource.text);
++								}
++							}
++						}
++						return parts.join("\n\n");
++					},
++				},
++			});
++		}
++	}
++	return commands;
++}
+diff --git a/packages/coding-agent/test/mcp-prompt-commands.test.ts b/packages/coding-agent/test/mcp-prompt-commands.test.ts
+new file mode 100644
+index 0000000..843bcc0
+--- /dev/null
++++ b/packages/coding-agent/test/mcp-prompt-commands.test.ts
+@@ -0,0 +1,49 @@
++import { describe, expect, it } from "bun:test";
++import type { CustomCommandContext } from "../src/extensibility/custom-commands";
++import type { MCPManager } from "../src/mcp/manager";
++import { buildMCPPromptCommands } from "../src/mcp/prompt-commands";
++
++describe("MCP prompt slash commands", () => {
++	const context = {} as CustomCommandContext;
++	it("preserves server namespaces, arguments and textual prompt content", async () => {
++		const calls: Array<{ server: string; prompt: string; args?: Record<string, string> }> = [];
++		const manager: Pick<MCPManager, "getConnectedServers" | "getServerPrompts" | "executePrompt"> = {
++			getConnectedServers: () => ["first", "second", "empty"],
++			getServerPrompts: server =>
++				server === "empty" ? undefined : [{ name: "review", description: "Review a topic" }],
++			async executePrompt(server, prompt, args) {
++				calls.push({ server, prompt, args });
++				return {
++					messages: [
++						{ role: "user", content: { type: "text", text: "Prompt text" } },
++						{
++							role: "user",
++							content: { type: "resource", resource: { uri: "fixture://topic", text: "Resource text" } },
++						},
++						{ role: "user", content: { type: "image", data: "fixture", mimeType: "image/png" } },
++					],
++				};
++			},
++		};
++		const commands = buildMCPPromptCommands(manager);
++		expect(commands.map(entry => entry.command.name)).toEqual(["first:review", "second:review"]);
++		expect(commands[0]?.command.description).toBe("Review a topic");
++		expect(await commands[1]!.command.execute(["topic=a=b", "empty=", "ignored"], context)).toBe(
++			"Prompt text\n\nResource text",
++		);
++		expect(calls).toEqual([{ server: "second", prompt: "review", args: { topic: "a=b", empty: "" } }]);
++	});
++
++	it("handles a prompt server disappearing before invocation", async () => {
++		const manager: Pick<MCPManager, "getConnectedServers" | "getServerPrompts" | "executePrompt"> = {
++			getConnectedServers: () => ["fixture"],
++			getServerPrompts: () => [{ name: "review" }],
++			async executePrompt() {
++				return undefined;
++			},
++		};
++		const [command] = buildMCPPromptCommands(manager);
++		expect(command?.command.description).toBe("MCP prompt from fixture");
++		expect(await command!.command.execute([], context)).toBe("");
++	});
++});
